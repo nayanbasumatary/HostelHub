@@ -11,7 +11,7 @@ export default function TermsPage() {
       <div className="rounded-3xl border border-black/10 bg-white p-8 shadow-sm dark:border-white/10 dark:bg-stone-950">
         <h1 className="mb-4 text-3xl font-extrabold text-stone-950 dark:text-white">Terms of Service</h1>
         <p className="mb-6 text-stone-600 dark:text-stone-400">
-          Welcome to FlopShop. These terms govern your use of the app, ordering process, and customer responsibilities.
+          Welcome to HostelHub. These terms govern your use of the app, ordering process, and customer responsibilities.
         </p>
         <div className="space-y-4 text-stone-700 dark:text-stone-200">
           <section>

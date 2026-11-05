@@ -103,7 +103,7 @@ function LoginForm() {
   return (
     <div className="text-center">
       <h1 className="mb-1 text-2xl font-bold text-white">
-        Welcome to FlopShop
+        Welcome to HostelHub
       </h1>
 
       <p className="mb-6 text-sm text-white/60">
