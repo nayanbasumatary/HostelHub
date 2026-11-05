@@ -1,0 +1,65 @@
+"use client";
+
+import { useTransition } from "react";
+import { useRouter } from "next/navigation";
+import toast from "react-hot-toast";
+import { Truck, Package } from "lucide-react";
+import { claimDeliveryOrderAction } from "@/app/admin/orders/actions";
+import { OrderStatusBadge } from "@/components/store/OrderStatusBadge";
+import { Button } from "@/components/ui/button";
+import { formatCurrency, formatTime } from "@/lib/utils/formatters";
+import type { Order } from "@/lib/types";
+
+export function AvailableDeliveryCard({ order, currency }: { order: Order; currency: string }) {
+  const [pending, startTransition] = useTransition();
+  const router = useRouter();
+
+  function claim() {
+    startTransition(async () => {
+      try {
+        const res = await claimDeliveryOrderAction(order.id);
+        if (!res.ok) {
+          toast.error(res.error ?? "Failed to claim order.");
+          return;
+        }
+        toast.success("Order claimed. Head to pickup now.");
+        router.refresh();
+      } catch {
+        toast.error("Unable to claim order. Please try again.");
+      }
+    });
+  }
+
+  return (
+    <div className="glass rounded-2xl p-4 transition-all hover:border-lime-400/30">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="truncate font-semibold text-white">{order.order_number}</p>
+          <p className="text-xs text-stone-500">{formatTime(order.created_at)}</p>
+        </div>
+        <OrderStatusBadge status={order.status} />
+      </div>
+
+      <div className="mt-3 space-y-1.5 text-sm text-stone-400">
+        <p className="break-words font-medium text-white">{order.customer_name}</p>
+        <p className="flex items-start gap-2">
+          <Truck className="mt-0.5 h-4 w-4 shrink-0 text-lime-400/70" />
+          <span className="min-w-0 break-words">Room {order.customer_room ?? "—"}</span>
+        </p>
+        <p className="flex items-start gap-2">
+          <Package className="mt-0.5 h-4 w-4 shrink-0 text-lime-400/70" />
+          <span className="min-w-0 break-words">
+            {order.order_items?.length ?? 0} item{(order.order_items?.length ?? 0) > 1 ? "s" : ""} ·{" "}
+            {formatCurrency(order.total_amount, currency)}
+          </span>
+        </p>
+      </div>
+
+      <div className="mt-3 flex items-center justify-between gap-3">
+        <Button size="sm" disabled={pending} onClick={claim} className="w-full">
+          Claim order
+        </Button>
+      </div>
+    </div>
+  );
+}

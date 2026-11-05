@@ -1,0 +1,922 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/server";
+import {
+  adjustStockForItems,
+  createOrder,
+  updateOrderStatus,
+  type CreateOrderInput,
+} from "@/lib/server/orders";
+import {
+  refundOrderCredit,
+  adjustWallet,
+  reconcileOrderAdjustment,
+  type WalletOwner,
+} from "@/lib/server/wallet";
+import { statusDeductsStock, deliverySplit, DOOR_CHANGE_MAX } from "@/lib/utils/orderHelpers";
+import { settingsToMap, DEFAULT_SETTINGS } from "@/lib/utils/settings";
+import type { OrderStatus, OrderType, PaymentMethod, PaymentStatus, Role } from "@/lib/types";
+
+async function requireRole(roles: Role[]): Promise<{ id: string; role: Role } | null> {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return null;
+  const { data } = await supabase.from("profiles").select("role").eq("id", user.id).single();
+  const role = (data?.role ?? "user") as Role;
+  return roles.includes(role) ? { id: user.id, role } : null;
+}
+
+export async function setOrderStatusAction(
+  orderId: string,
+  status: OrderStatus,
+  otp_code?: string,
+  cancel_reason?: string | null
+) {
+  const actor = await requireRole(["admin", "delivery"]);
+  if (!actor) return { ok: false, error: "Not authorized." };
+
+  // Read the order (service role) to enforce type/ownership rules.
+  const admin = createAdminClient();
+  const { data: order } = await admin
+    .from("orders")
+    .select("order_type, delivery_person_id, otp_code, status, is_manual")
+    .eq("id", orderId)
+    .single();
+  if (!order) return { ok: false, error: "Order not found." };
+
+  const isDelivery = order.order_type === "delivery";
+  const isDispatchOrComplete = status === "out_for_delivery" || status === "delivered";
+  const isAssignedToActor = order.delivery_person_id === actor.id;
+
+  if (isDelivery && isDispatchOrComplete) {
+    // Dispatch / completion of a delivery is reserved for whoever is assigned to
+    // it — a delivery partner OR an admin who claimed it on the delivery page.
+    if (!isAssignedToActor) {
+      return { ok: false, error: "Only the assigned delivery partner can dispatch or complete this order." };
+    }
+  } else if (actor.role === "delivery") {
+    // Delivery partners may only dispatch/complete their assigned orders (above);
+    // they can't set any other status.
+    return { ok: false, error: "Not allowed." };
+  }
+
+  // OTP completion only applies to online orders that actually have one. Manual /
+  // walk-in orders are handed over in person, so an admin completes them directly.
+  if (status === "delivered" && !order.is_manual && order.otp_code) {
+    if (!otp_code || otp_code.trim().length !== 4) {
+      return { ok: false, error: "Enter the 4-digit order OTP." };
+    }
+    if (order.otp_code !== otp_code.trim()) {
+      return { ok: false, error: "Incorrect OTP. Please try again." };
+    }
+  }
+
+  if (status === "cancelled" && !cancel_reason?.trim()) {
+    return { ok: false, error: "Enter a cancellation reason." };
+  }
+
+  const result = await updateOrderStatus(orderId, status, cancel_reason);
+  revalidatePath("/admin/orders");
+  revalidatePath(`/admin/orders/${orderId}`);
+  revalidatePath("/delivery");
+  return result;
+}
+
+/**
+ * Complete a cash delivery when the partner had no change. `cash_received` is
+ * what the customer actually handed over: the difference against the order total
+ * lands in their wallet — a positive one as store credit, a negative one as a
+ * debt they settle later. Capped at DOOR_CHANGE_MAX so a typo can't create a
+ * large liability, and gated on the OTP like any other completion, so the
+ * customer consents to the rounding at the moment they hand the code over.
+ *
+ * The order total is never rewritten (it feeds revenue and the shareholder
+ * split); the cash taken is recorded separately in `cash_collected` and only
+ * changes what this partner owes the shop at settlement.
+ */
+export async function completeCashDeliveryAction(
+  orderId: string,
+  otp_code: string,
+  cash_received: number
+): Promise<{ ok: boolean; error?: string; delta?: number }> {
+  const actor = await requireRole(["admin", "delivery"]);
+  if (!actor) return { ok: false, error: "Not authorized." };
+
+  const admin = createAdminClient();
+  const { data: order } = await admin
+    .from("orders")
+    .select(
+      "id, order_number, order_type, delivery_person_id, otp_code, status, is_manual, payment_method, total_amount, user_id, customer_name, customer_phone, customer_room"
+    )
+    .eq("id", orderId)
+    .single();
+  if (!order) return { ok: false, error: "Order not found." };
+
+  if (order.order_type !== "delivery") return { ok: false, error: "Not a delivery order." };
+  if (order.delivery_person_id !== actor.id) {
+    return { ok: false, error: "Only the assigned delivery partner can complete this order." };
+  }
+  if (order.status === "delivered" || order.status === "cancelled") {
+    return { ok: false, error: "This order is already closed." };
+  }
+  // Only cash changes hands at the door. UPI and wallet-paid orders are settled
+  // to the exact amount already, so there is no change to round.
+  if ((order.payment_method ?? "").toLowerCase() !== "cash") {
+    return { ok: false, error: "Only cash orders can settle change as credit." };
+  }
+
+  if (!order.is_manual && order.otp_code) {
+    if (!otp_code || otp_code.trim().length !== 4) {
+      return { ok: false, error: "Enter the 4-digit order OTP." };
+    }
+    if (order.otp_code !== otp_code.trim()) {
+      return { ok: false, error: "Incorrect OTP. Please try again." };
+    }
+  }
+
+  const total = Number(order.total_amount);
+  const received = Number(cash_received);
+  if (!Number.isFinite(received) || received < 0) {
+    return { ok: false, error: "Enter the cash received." };
+  }
+  const delta = Math.round((received - total) * 100) / 100;
+  if (Math.abs(delta) > DOOR_CHANGE_MAX) {
+    return {
+      ok: false,
+      error: `The difference can't be more than ₹${DOOR_CHANGE_MAX}. Collect the exact amount or use the shop QR.`,
+    };
+  }
+
+  const moves = Math.abs(delta) >= 0.005;
+  const owner = moves ? await resolveOrderWalletOwner(order) : null;
+  if (moves && !owner) return { ok: false, error: "No account to hold the difference." };
+
+  const result = await updateOrderStatus(orderId, "delivered");
+  if (!result.ok) return result;
+
+  await admin
+    .from("orders")
+    .update({
+      cash_collected: received,
+      amount_paid: total,
+      payment_status: "paid",
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", orderId);
+
+  if (moves && owner) {
+    const res = await adjustWallet({
+      owner,
+      amount: delta,
+      // Overpaid change kept as credit is exactly the existing "change" case; a
+      // shortfall is a tab, which the ledger records as an adjustment.
+      type: delta > 0 ? "change" : "adjustment",
+      method: "cash",
+      actorId: actor.id,
+      orderId,
+      note:
+        delta > 0
+          ? `No change on order ${order.order_number} — kept as credit`
+          : `Short cash on order ${order.order_number} — owed to the shop`,
+      // A shortfall is allowed to push the wallet negative (customer owes).
+      allowNegative: true,
+    });
+    if (!res.ok) {
+      // The handover already happened and the order is delivered — don't undo
+      // that, but make it loud so an admin can apply the wallet move by hand.
+      return {
+        ok: false,
+        error: `Delivered, but the wallet update failed (${res.error}). Ask an admin to adjust it manually.`,
+      };
+    }
+  }
+
+  revalidatePath("/admin/orders");
+  revalidatePath(`/admin/orders/${orderId}`);
+  revalidatePath("/admin/delivery");
+  revalidatePath("/delivery");
+  return { ok: true, delta };
+}
+
+export async function claimDeliveryOrderAction(orderId: string) {
+  const actor = await requireRole(["delivery", "admin"]);
+  if (!actor) return { ok: false, error: "Not authorized." };
+
+  const admin = createAdminClient();
+  const { data: order, error } = await admin
+    .from("orders")
+    .select("order_type, status, delivery_person_id, delivery_fee")
+    .eq("id", orderId)
+    .single();
+
+  if (error || !order) return { ok: false, error: error?.message ?? "Order not found." };
+  if (order.order_type !== "delivery") return { ok: false, error: "Only delivery orders can be claimed." };
+  if (order.delivery_person_id) return { ok: false, error: "Order already claimed." };
+  if (order.status === "delivered" || order.status === "cancelled") {
+    return { ok: false, error: "This order can no longer be claimed." };
+  }
+
+  // Whoever delivers the order — delivery partner OR an admin who claimed it —
+  // always earns the delivery-person share from settings. The split set at
+  // order creation (person 8 / shop 2) is kept regardless of payment method
+  // (cash collected at the door, or UPI paid to the shop QR).
+
+  // Take the order first. The `delivery_person_id IS NULL` guard makes this
+  // atomic: a second partner racing for the same order matches zero rows.
+  const { data: claimed, error: updErr } = await admin
+    .from("orders")
+    .update({ delivery_person_id: actor.id, updated_at: new Date().toISOString() })
+    .eq("id", orderId)
+    .is("delivery_person_id", null)
+    .select("id");
+
+  if (updErr) return { ok: false, error: updErr.message };
+  if (!claimed?.length) return { ok: false, error: "Order already claimed." };
+
+  // Claiming a pending order also confirms it — and confirming is what takes the
+  // items off the shelf. This must go through updateOrderStatus: setting
+  // `status` on the row here (as this used to) skipped the pending → confirmed
+  // stock deduction entirely, so delivered orders never reduced stock.
+  // Payment is NOT auto-marked: a delivery is paid at the door, not on claim.
+  if (order.status === "pending") {
+    const res = await updateOrderStatus(orderId, "confirmed", null, { markPaid: false });
+    if (!res.ok) return res;
+  }
+
+  revalidatePath("/admin/orders");
+  revalidatePath("/delivery");
+  return { ok: true };
+}
+
+/**
+ * Customer paid the shop's UPI at the door (the delivery person couldn't accept
+ * UPI). The order's OTP is the shared proof: a correct OTP — read out by the
+ * customer only after they've paid — marks the order PAID (UPI) and delivered in
+ * one step. Reserved for whoever is assigned to the delivery.
+ */
+export async function confirmUpiToShopAction(orderId: string, otp_code: string) {
+  const actor = await requireRole(["admin", "delivery"]);
+  if (!actor) return { ok: false, error: "Not authorized." };
+
+  const admin = createAdminClient();
+  const { data: order } = await admin
+    .from("orders")
+    .select("order_type, delivery_person_id, otp_code, status, is_manual")
+    .eq("id", orderId)
+    .single();
+  if (!order) return { ok: false, error: "Order not found." };
+
+  if (order.order_type !== "delivery") {
+    return { ok: false, error: "Only delivery orders use shop-UPI payment." };
+  }
+  if (order.delivery_person_id !== actor.id) {
+    return { ok: false, error: "Only the assigned delivery partner can confirm this payment." };
+  }
+  if (order.status === "delivered" || order.status === "cancelled") {
+    return { ok: false, error: "This order is already closed." };
+  }
+  // OTP is the proof. Online orders always carry one; only skip if there is none.
+  if (order.otp_code) {
+    if (!otp_code || otp_code.trim().length !== 4) {
+      return { ok: false, error: "Enter the customer's 4-digit OTP." };
+    }
+    if (order.otp_code !== otp_code.trim()) {
+      return { ok: false, error: "Incorrect OTP. Please try again." };
+    }
+  }
+
+  // Mark paid via UPI, then complete the delivery (stock handling lives there).
+  const { error: payErr } = await admin
+    .from("orders")
+    .update({ payment_method: "upi", payment_status: "paid", updated_at: new Date().toISOString() })
+    .eq("id", orderId);
+  if (payErr) return { ok: false, error: payErr.message };
+
+  const result = await updateOrderStatus(orderId, "delivered");
+  revalidatePath("/admin/orders");
+  revalidatePath(`/admin/orders/${orderId}`);
+  revalidatePath("/delivery");
+  return result;
+}
+
+/**
+ * Admin edits an order's line items: swap a flavour, fix qty/price, ADD a brand
+ * new line, or remove one. Existing rows carry an `id` (matched + updated);
+ * rows without an `id` are inserted; any existing item the admin dropped from
+ * the list is deleted. The order's subtotal/total are recomputed afterwards,
+ * and the customer's order page updates live (it subscribes to realtime).
+ */
+export async function updateOrderItemsAction(
+  orderId: string,
+  items: { id?: string | null; product_id?: string | null; product_name: string; quantity: number; unit_price: number }[]
+) {
+  if (!(await requireRole(["admin"]))) return { ok: false, error: "Not authorized." };
+  if (!items.length) return { ok: false, error: "An order must have at least one item." };
+  const admin = createAdminClient();
+
+  // Anything currently on the order but not resubmitted gets removed.
+  const { data: existing } = await admin.from("order_items").select("id").eq("order_id", orderId);
+  const keepIds = new Set(items.filter((i) => i.id).map((i) => i.id as string));
+  const toDelete = (existing ?? []).map((r) => r.id).filter((id) => !keepIds.has(id));
+
+  // Cost snapshot for brand-new lines: read the product's live cost so profit
+  // reports stay accurate (matches how createOrder snapshots cost at order time).
+  const newProductIds = [...new Set(items.filter((i) => !i.id && i.product_id).map((i) => i.product_id as string))];
+  const costMap = new Map<string, number>();
+  if (newProductIds.length) {
+    const { data: prods } = await admin.from("products").select("id, cost_price").in("id", newProductIds);
+    for (const p of prods ?? []) costMap.set(p.id, Number(p.cost_price) || 0);
+  }
+
+  for (const it of items) {
+    const qty = Math.max(1, Math.floor(it.quantity));
+    const unit = Math.max(0, Number(it.unit_price) || 0);
+    const name = it.product_name.trim() || "Item";
+    if (it.id) {
+      const { error } = await admin
+        .from("order_items")
+        .update({ product_name: name, quantity: qty, unit_price: unit, total_price: qty * unit })
+        .eq("id", it.id)
+        .eq("order_id", orderId);
+      if (error) return { ok: false, error: error.message };
+    } else {
+      const { error } = await admin.from("order_items").insert({
+        order_id: orderId,
+        product_id: it.product_id ?? null,
+        product_name: name,
+        quantity: qty,
+        unit_price: unit,
+        total_price: qty * unit,
+        cost_price: it.product_id ? costMap.get(it.product_id) ?? 0 : 0,
+      });
+      if (error) return { ok: false, error: error.message };
+    }
+  }
+
+  if (toDelete.length) {
+    const { error } = await admin.from("order_items").delete().in("id", toDelete).eq("order_id", orderId);
+    if (error) return { ok: false, error: error.message };
+  }
+
+  const { error: recalcErr } = await admin.rpc("recompute_order_totals", { p_order_id: orderId });
+  if (recalcErr) return { ok: false, error: recalcErr.message };
+
+  revalidatePath("/admin/orders");
+  revalidatePath(`/admin/orders/${orderId}`);
+  revalidatePath("/orders");
+  revalidatePath(`/orders/${orderId}`);
+  return { ok: true };
+}
+
+export async function assignDeliveryAction(orderId: string, deliveryPersonId: string | null) {
+  const actor = await requireRole(["admin"]);
+  if (!actor) return { ok: false, error: "Not authorized." };
+  const admin = createAdminClient();
+  const { error } = await admin
+    .from("orders")
+    .update({ delivery_person_id: deliveryPersonId, updated_at: new Date().toISOString() })
+    .eq("id", orderId);
+  revalidatePath("/admin/orders");
+  revalidatePath(`/admin/orders/${orderId}`);
+  revalidatePath("/delivery");
+  return error ? { ok: false, error: error.message } : { ok: true };
+}
+
+export async function setPaymentStatusAction(orderId: string, status: PaymentStatus) {
+  const actor = await requireRole(["admin", "delivery"]);
+  if (!actor) return { ok: false, error: "Not authorized." };
+  const admin = createAdminClient();
+  // Keep amount_paid consistent: full when marked paid, zero when reverted to
+  // pending. (Partial amounts are set via the manual-order / partial flow.)
+  const patch: Record<string, unknown> = { payment_status: status, updated_at: new Date().toISOString() };
+  if (status === "paid" || status === "pending") {
+    const { data: order } = await admin.from("orders").select("total_amount").eq("id", orderId).single();
+    patch.amount_paid = status === "paid" ? Number(order?.total_amount ?? 0) : 0;
+  }
+  const { error } = await admin.from("orders").update(patch).eq("id", orderId);
+  revalidatePath("/admin/orders");
+  revalidatePath(`/admin/orders/${orderId}`);
+  return error ? { ok: false, error: error.message } : { ok: true };
+}
+
+/**
+ * Record an order's payment as a cash / UPI / wallet mix — the same model the
+ * manual-order form uses, so an order can be corrected after the fact with the
+ * exact breakdown rather than a single method label.
+ *
+ * The wallet is the balancing item: whatever the cash and UPI legs don't cover
+ * is debited from the customer's store credit, and anything over the total is
+ * parked there as change. The `credit` argument is what the admin typed, used
+ * to derive the stored method and to check the wallet can cover it — the actual
+ * movement is always `(cash + upi) − total`, so the three legs can't disagree
+ * with the order's books.
+ */
+export async function setOrderPaymentAction(
+  orderId: string,
+  legs: { cash?: number; upi?: number; credit?: number }
+) {
+  const actor = await requireRole(["admin"]);
+  if (!actor) return { ok: false, error: "Not authorized." };
+
+  const admin = createAdminClient();
+  const { data: order } = await admin
+    .from("orders")
+    .select("total_amount, payment_method, user_id, customer_name, customer_phone, customer_room, order_number")
+    .eq("id", orderId)
+    .single();
+  if (!order) return { ok: false, error: "Order not found." };
+
+  const total = Number(order.total_amount);
+  const cash = Math.max(Number(legs.cash) || 0, 0);
+  const upi = Math.max(Number(legs.upi) || 0, 0);
+  const typedCredit = Math.max(Number(legs.credit) || 0, 0);
+  const collected = cash + upi;
+
+  const method: PaymentMethod =
+    typedCredit > 0 ? "credit" : cash > 0 && upi > 0 ? "split" : upi > 0 ? "upi" : "cash";
+
+  const oldMethod = (order.payment_method ?? "").toLowerCase();
+  const owner = await resolveOrderWalletOwner(order);
+  const now = new Date().toISOString();
+
+  if (typedCredit > 0 && !owner) {
+    return { ok: false, error: "No customer wallet to charge. Add a name or phone to this order first." };
+  }
+
+  // Legacy credit charges were written as `order_payment` rows, which the
+  // adjustment ledger below doesn't net against — release them first so the
+  // order isn't charged twice.
+  if (oldMethod === "credit" && owner) await refundOrderCredit(orderId, actor.id);
+
+  if (owner) {
+    const gap = collected - total;
+    const rec = await reconcileOrderAdjustment({
+      owner,
+      orderId,
+      targetNet: gap,
+      actorId: actor.id,
+      note:
+        gap >= 0
+          ? `Order ${order.order_number}: ₹${gap.toFixed(2)} kept as credit`
+          : `Order ${order.order_number}: ₹${(-gap).toFixed(2)} paid from store credit`,
+    });
+    if (!rec.ok) return { ok: false, error: rec.error };
+  }
+
+  // With a wallet in play the order is always fully settled — the leftover lives
+  // on the customer. Without one, the shortfall stays an order-level partial.
+  const settled = !!owner || collected >= total;
+  const paid = owner ? total : Math.min(collected, total);
+  const status: PaymentStatus = settled ? "paid" : paid > 0 ? "partial" : "pending";
+
+  const { error } = await admin
+    .from("orders")
+    .update({
+      payment_method: method,
+      paid_cash: cash,
+      paid_upi: upi,
+      amount_paid: paid,
+      payment_status: status,
+      updated_at: now,
+    })
+    .eq("id", orderId);
+
+  revalidatePath("/admin/orders");
+  revalidatePath(`/admin/orders/${orderId}`);
+  revalidatePath("/admin/customers");
+  revalidatePath("/admin/reports");
+  if (order.user_id) revalidatePath(`/admin/users/${order.user_id}`);
+  return error ? { ok: false, error: error.message } : { ok: true };
+}
+
+/**
+ * Record how much was actually handed over for an order, and settle the rest
+ * against the customer's store credit (two-way): overpaid cash becomes credit,
+ * an underpayment becomes a debt the customer owes. The order is then marked
+ * settled — the leftover balance lives on the customer, not the order.
+ *
+ * Falls back to plain partial tracking on the order itself when there's no
+ * customer to tie credit to, or when the order is paid by store credit already
+ * (that wallet relationship is owned by the credit/refund flow).
+ */
+export async function setAmountPaidAction(orderId: string, amount: number) {
+  const actor = await requireRole(["admin", "delivery"]);
+  if (!actor) return { ok: false, error: "Not authorized." };
+  const admin = createAdminClient();
+  const { data: order } = await admin
+    .from("orders")
+    .select("total_amount, user_id, customer_name, customer_phone, customer_room, payment_method, order_number")
+    .eq("id", orderId)
+    .single();
+  if (!order) return { ok: false, error: "Order not found." };
+
+  const total = Number(order.total_amount);
+  const typed = Math.max(Number(amount) || 0, 0);
+  const isCredit = (order.payment_method ?? "").toLowerCase() === "credit";
+  const owner = isCredit ? null : await resolveOrderWalletOwner(order);
+
+  // No customer wallet (or a credit order): keep the old order-level partial.
+  if (!owner) {
+    const paid = Math.min(typed, total);
+    const status: PaymentStatus = paid >= total ? "paid" : paid > 0 ? "partial" : "pending";
+    const { error } = await admin
+      .from("orders")
+      .update({ amount_paid: paid, payment_status: status, updated_at: new Date().toISOString() })
+      .eq("id", orderId);
+    revalidatePath("/admin/orders");
+    revalidatePath(`/admin/orders/${orderId}`);
+    return error ? { ok: false, error: error.message } : { ok: true };
+  }
+
+  // Move the gap vs the total onto the customer's wallet (+ credit / − debt).
+  const rec = await reconcileOrderAdjustment({
+    owner,
+    orderId,
+    targetNet: typed - total,
+    actorId: actor.id,
+    note:
+      typed >= total
+        ? `Order ${order.order_number}: ₹${(typed - total).toFixed(2)} change kept as credit`
+        : `Order ${order.order_number}: ₹${(total - typed).toFixed(2)} owed by customer`,
+  });
+  if (!rec.ok) return { ok: false, error: rec.error };
+
+  const { error } = await admin
+    .from("orders")
+    .update({ amount_paid: total, payment_status: "paid", updated_at: new Date().toISOString() })
+    .eq("id", orderId);
+  revalidatePath("/admin/orders");
+  revalidatePath(`/admin/orders/${orderId}`);
+  revalidatePath("/admin/customers");
+  if (order.user_id) revalidatePath(`/admin/users/${order.user_id}`);
+  return error ? { ok: false, error: error.message } : { ok: true };
+}
+
+/**
+ * Change an order's type (pickup ⇄ delivery). Admin only. Recomputes the
+ * delivery fee / earnings split and the order total to match the new type.
+ */
+export async function setOrderTypeAction(orderId: string, orderType: OrderType) {
+  if (!(await requireRole(["admin"]))) return { ok: false, error: "Not authorized." };
+  if (orderType !== "pickup" && orderType !== "delivery") {
+    return { ok: false, error: "Invalid order type." };
+  }
+
+  const admin = createAdminClient();
+  const { data: order } = await admin
+    .from("orders")
+    .select("id, subtotal")
+    .eq("id", orderId)
+    .single();
+  if (!order) return { ok: false, error: "Order not found." };
+
+  const settings = settingsToMap((await admin.from("settings").select("key, value")).data);
+  const split = deliverySplit({ ...DEFAULT_SETTINGS, ...settings }, orderType, Number(order.subtotal));
+
+  const { error } = await admin
+    .from("orders")
+    .update({
+      order_type: orderType,
+      delivery_fee: split.delivery_fee,
+      delivery_person_earning: split.delivery_person_earning,
+      admin_delivery_earning: split.admin_delivery_earning,
+      total_amount: Number(order.subtotal) + split.delivery_fee,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", orderId);
+
+  revalidatePath("/admin/orders");
+  revalidatePath(`/admin/orders/${orderId}`);
+  revalidatePath(`/orders/${orderId}`);
+  return error ? { ok: false, error: error.message } : { ok: true };
+}
+
+/**
+ * Edit an order's (walk-in) customer details — name, phone, room. Admin only.
+ * Updates the denormalised fields stored on the order itself.
+ */
+export async function updateOrderCustomerAction(
+  orderId: string,
+  data: { customer_name: string; customer_phone?: string | null; customer_room?: string | null }
+) {
+  if (!(await requireRole(["admin"]))) return { ok: false, error: "Not authorized." };
+  const name = data.customer_name?.trim();
+  if (!name) return { ok: false, error: "Customer name is required." };
+
+  const admin = createAdminClient();
+  const { error } = await admin
+    .from("orders")
+    .update({
+      customer_name: name,
+      customer_phone: data.customer_phone?.trim() || null,
+      customer_room: data.customer_room?.trim() || null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", orderId);
+
+  revalidatePath("/admin/orders");
+  revalidatePath(`/admin/orders/${orderId}`);
+  return error ? { ok: false, error: error.message } : { ok: true };
+}
+
+/**
+ * Change an order's payment method (admin only). Mirrors the manual-order
+ * choices: cash / upi / split / credit (wallet) / bank transfer / other.
+ *
+ * - split    — records the cash/UPI breakdown (UPI = total − cash), order paid.
+ * - credit   — charges the whole order to the customer's store credit (may push
+ *              the wallet into debt), order paid. Leaving credit refunds it.
+ * - others   — relabel only; the split breakdown is cleared.
+ */
+export async function setPaymentMethodAction(
+  orderId: string,
+  method: string,
+  opts?: { paidCash?: number }
+) {
+  const actor = await requireRole(["admin"]);
+  if (!actor) return { ok: false, error: "Not authorized." };
+  const normalized = method.trim().toLowerCase();
+  const ALLOWED = ["cash", "upi", "split", "credit", "bank transfer", "other"];
+  if (!ALLOWED.includes(normalized)) return { ok: false, error: "Invalid payment method." };
+
+  const admin = createAdminClient();
+  const { data: order } = await admin
+    .from("orders")
+    .select("total_amount, payment_method, user_id, customer_name, customer_phone, customer_room, order_number")
+    .eq("id", orderId)
+    .single();
+  if (!order) return { ok: false, error: "Order not found." };
+
+  const total = Number(order.total_amount);
+  const oldMethod = (order.payment_method ?? "").toLowerCase();
+  const now = new Date().toISOString();
+
+  // Pay the whole order from the customer's store credit.
+  if (normalized === "credit") {
+    const owner = await resolveOrderWalletOwner(order);
+    if (!owner) {
+      return { ok: false, error: "No customer wallet to charge. Add a name or phone to this order first." };
+    }
+    // Reset any earlier credit charge so we debit exactly the total once.
+    await reconcileOrderAdjustment({ owner, orderId, targetNet: 0, actorId: actor.id });
+    await refundOrderCredit(orderId, actor.id);
+    if (total > 0) {
+      const debit = await reconcileOrderAdjustment({
+        owner,
+        orderId,
+        targetNet: -total,
+        actorId: actor.id,
+        note: `Order ${order.order_number} paid by store credit`,
+      });
+      if (!debit.ok) return { ok: false, error: debit.error };
+    }
+    const { error } = await admin
+      .from("orders")
+      .update({
+        payment_method: "credit",
+        paid_cash: 0,
+        paid_upi: 0,
+        amount_paid: total,
+        payment_status: "paid",
+        updated_at: now,
+      })
+      .eq("id", orderId);
+    revalidatePath("/admin/orders");
+    revalidatePath(`/admin/orders/${orderId}`);
+    revalidatePath("/admin/customers");
+    revalidatePath("/admin/reports");
+    if (order.user_id) revalidatePath(`/admin/users/${order.user_id}`);
+    return error ? { ok: false, error: error.message } : { ok: true };
+  }
+
+  // Switching away from credit returns whatever it charged back to the wallet.
+  if (oldMethod === "credit") {
+    const owner = await resolveOrderWalletOwner(order);
+    if (owner) await reconcileOrderAdjustment({ owner, orderId, targetNet: 0, actorId: actor.id });
+    await refundOrderCredit(orderId, actor.id);
+  }
+
+  const patch: Record<string, unknown> = {
+    payment_method: normalized,
+    paid_cash: 0,
+    paid_upi: 0,
+    updated_at: now,
+  };
+  if (normalized === "split") {
+    const cash = Math.min(Math.max(Number(opts?.paidCash) || 0, 0), total);
+    patch.paid_cash = cash;
+    patch.paid_upi = Math.max(total - cash, 0);
+    patch.amount_paid = total;
+    patch.payment_status = "paid";
+  } else if (oldMethod === "credit") {
+    // We just released the wallet charge — record the order as paid by the new
+    // method so it isn't left looking unpaid.
+    patch.amount_paid = total;
+    patch.payment_status = "paid";
+  }
+
+  const { error } = await admin.from("orders").update(patch).eq("id", orderId);
+  revalidatePath("/admin/orders");
+  revalidatePath(`/admin/orders/${orderId}`);
+  revalidatePath("/admin/customers");
+  revalidatePath("/admin/reports");
+  if (order.user_id) revalidatePath(`/admin/users/${order.user_id}`);
+  return error ? { ok: false, error: error.message } : { ok: true };
+}
+
+/**
+ * Permanently delete an order (and its items, via ON DELETE CASCADE). If the
+ * order had deducted stock (any non-pending, non-cancelled status), the stock is
+ * restored first so inventory stays correct. Admin only — irreversible.
+ */
+export async function deleteOrderAction(orderId: string) {
+  const actor = await requireRole(["admin"]);
+  if (!actor) return { ok: false, error: "Not authorized." };
+  const admin = createAdminClient();
+
+  const { data: order, error } = await admin
+    .from("orders")
+    .select("id, status, order_items(product_id, quantity)")
+    .eq("id", orderId)
+    .single();
+  if (error || !order) return { ok: false, error: error?.message ?? "Order not found." };
+
+  // Put stock back if this order was holding it.
+  if (statusDeductsStock(order.status as OrderStatus)) {
+    const items = (order.order_items ?? []) as { product_id: string | null; quantity: number }[];
+    await adjustStockForItems(admin, items, 1);
+  }
+
+  // Refund any store credit charged to this order BEFORE deleting it (the
+  // ledger's order_id link is cleared on delete, so we must reverse it first).
+  await refundOrderCredit(orderId, actor.id);
+
+  const { error: delErr } = await admin.from("orders").delete().eq("id", orderId);
+  if (delErr) return { ok: false, error: delErr.message };
+
+  revalidatePath("/admin/orders");
+  revalidatePath("/admin");
+  return { ok: true };
+}
+
+export async function createManualOrderAction(
+  input: Omit<CreateOrderInput, "confirm" | "is_manual"> & {
+    payment_pending?: boolean;
+    /** When payment is pending, how much the customer paid up front (0 = none). */
+    amount_paid?: number;
+    /** Cash overpaid with no change available — credited to the customer's wallet. */
+    overpay_to_wallet?: number;
+  }
+) {
+  const actor = await requireRole(["admin"]);
+  if (!actor) return { ok: false, error: "Not authorized." };
+
+  const { payment_pending, amount_paid, overpay_to_wallet, ...orderInput } = input;
+
+  // Walk-in orders are handed over on the spot: create confirmed + paid, then
+  // mark completed so it lands fully done (no OTP — manual orders skip it).
+  const res = await createOrder({ ...orderInput, is_manual: true, confirm: true });
+  if (!res.ok || !res.order) return res;
+
+  await updateOrderStatus(res.order.id, "delivered");
+
+  const total = Number(res.order.total_amount);
+  const admin = createAdminClient();
+
+  // Remember the walk-in customer (best-effort) and get their id so we can move
+  // wallet credit. Matched by name (case-insensitive): a new name is added, an
+  // existing one is merged — filling in a phone/room we didn't have before.
+  // An order billed to an app user already has a wallet (their profile's), so
+  // skip the directory entirely rather than shadowing them with a walk-in row.
+  const customerId = orderInput.user_id
+    ? null
+    : await upsertCustomerByName(input.customer_name, input.customer_phone, input.customer_room);
+  const walletOwner: WalletOwner | null = orderInput.user_id
+    ? { profileId: orderInput.user_id }
+    : customerId
+      ? { customerId }
+      : null;
+
+  if (orderInput.payment_method === "credit") {
+    // Wallet covered its share (debited by createOrder). The cash/UPI shortfall is
+    // collected at the counter — but maybe not in full, so honor the amount the
+    // form says was actually paid (defaults to the whole total when unspecified).
+    // The wallet portion is always collected, so never record less than that.
+    const walletPaid = Math.max(
+      total - Number(res.order.paid_cash ?? 0) - Number(res.order.paid_upi ?? 0),
+      0
+    );
+    const paid = Math.min(Math.max(amount_paid != null ? Number(amount_paid) : total, walletPaid), total);
+    const status: PaymentStatus = paid >= total ? "paid" : paid > 0 ? "partial" : "pending";
+    await admin
+      .from("orders")
+      .update({ payment_status: status, amount_paid: paid, updated_at: new Date().toISOString() })
+      .eq("id", res.order.id);
+  } else if (payment_pending) {
+    // The goods are handed over but payment isn't fully collected. Record how
+    // much was paid now (could be 0, or a partial amount) so the balance is clear.
+    const paid = Math.min(Math.max(Number(amount_paid) || 0, 0), total);
+    const status = paid >= total ? "paid" : paid > 0 ? "partial" : "pending";
+    await admin
+      .from("orders")
+      .update({ payment_status: status, amount_paid: paid, updated_at: new Date().toISOString() })
+      .eq("id", res.order.id);
+  } else {
+    // Fully paid on the spot — record the whole total as collected.
+    await admin
+      .from("orders")
+      .update({ amount_paid: total, updated_at: new Date().toISOString() })
+      .eq("id", res.order.id);
+  }
+
+  // Cash overpaid and no change to return → park the difference as store credit
+  // in the customer's wallet (the original "give credit instead of change" case).
+  const overpay = Math.max(Number(overpay_to_wallet) || 0, 0);
+  if (overpay > 0 && walletOwner) {
+    await adjustWallet({
+      owner: walletOwner,
+      amount: overpay,
+      type: "change",
+      method: "cash",
+      actorId: actor.id,
+      note: `Change from order ${res.order.order_number} kept as credit`,
+    });
+  }
+
+  revalidatePath("/admin/orders/new");
+  revalidatePath("/admin/orders");
+  revalidatePath("/admin/customers");
+  return { ...res, order: { ...res.order, status: "delivered" as OrderStatus } };
+}
+
+/**
+ * The wallet that an order's balance belongs to: the signed-in customer's
+ * profile when the order has a `user_id`, otherwise the walk-in customer matched
+ * (or created) by name. Returns null when there's nothing to tie credit to.
+ */
+async function resolveOrderWalletOwner(order: {
+  user_id?: string | null;
+  customer_name?: string | null;
+  customer_phone?: string | null;
+  customer_room?: string | null;
+}): Promise<WalletOwner | null> {
+  if (order.user_id) return { profileId: order.user_id };
+  const customerId = await upsertCustomerByName(
+    order.customer_name ?? "",
+    order.customer_phone,
+    order.customer_room
+  );
+  return customerId ? { customerId } : null;
+}
+
+/**
+ * Save/merge a walk-in customer into the `customers` directory. Phone is
+ * optional (the table requires NOT NULL, so we store an empty string when none
+ * is given). Never throws — a failure here must not fail the completed order.
+ */
+async function upsertCustomerByName(
+  name: string,
+  phone?: string | null,
+  room?: string | null
+): Promise<string | null> {
+  const trimmed = name?.trim();
+  if (!trimmed) return null;
+  const admin = createAdminClient();
+  try {
+    // ilike with no wildcards is an exact, case-insensitive match.
+    const { data: matches } = await admin
+      .from("customers")
+      .select("id, phone, room_number")
+      .ilike("name", trimmed)
+      .limit(1);
+    const existing = matches?.[0];
+
+    if (existing) {
+      const patch: Record<string, unknown> = {};
+      if (phone?.trim() && !existing.phone?.trim()) patch.phone = phone.trim();
+      if (room?.trim() && room.trim() !== (existing.room_number ?? "")) patch.room_number = room.trim();
+      if (Object.keys(patch).length) {
+        patch.updated_at = new Date().toISOString();
+        await admin.from("customers").update(patch).eq("id", existing.id);
+      }
+      return existing.id;
+    }
+    const { data: inserted } = await admin
+      .from("customers")
+      .insert({
+        name: trimmed,
+        phone: phone?.trim() || "",
+        room_number: room?.trim() || null,
+      })
+      .select("id")
+      .single();
+    return inserted?.id ?? null;
+  } catch {
+    // Directory bookkeeping only — swallow errors so the order still succeeds.
+    return null;
+  }
+}

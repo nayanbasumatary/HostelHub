@@ -1,0 +1,277 @@
+"use client";
+
+import { useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import Image from "next/image";
+import Link from "next/link";
+import { Plus, Minus } from "lucide-react";
+import toast from "react-hot-toast";
+import { createClient } from "@/lib/supabase/client";
+import { createSupplierAction } from "@/app/admin/suppliers/actions";
+import { Button } from "@/components/ui/button";
+import { Input, Label, Select, Textarea } from "@/components/ui/input";
+import { Autocomplete } from "@/components/ui/autocomplete";
+import { DatePicker } from "@/components/ui/date-picker";
+import { AdminCard } from "@/components/admin/StatCard";
+import { formatCurrency, toISODate } from "@/lib/utils/formatters";
+import { imagePositionStyle } from "@/lib/utils/image";
+import type { Product, Supplier } from "@/lib/types";
+
+/** Where "Add a new product" sends the admin back to once the product exists. */
+export const NEW_PURCHASE_PATH = "/admin/purchases/new";
+
+const inputDark = "border-[#333] bg-[#0a0a0a] text-white focus:border-indigo-500";
+const stepperBtn =
+  "grid h-10 w-10 shrink-0 place-items-center rounded-lg border border-[#333] bg-[#0a0a0a] text-white transition hover:bg-white/10";
+
+/**
+ * Row shown for a product in the picker — thumbnail, name and current stock.
+ * Built from spans so it nests cleanly inside the trigger's inline label too.
+ */
+function ProductOption({ product }: { product: Product }) {
+  return (
+    <span className="flex min-w-0 items-center gap-2">
+      <span className="relative block h-6 w-6 shrink-0 overflow-hidden rounded bg-white/10">
+        {product.image_url ? (
+          <Image
+            src={product.image_url}
+            alt=""
+            fill
+            sizes="24px"
+            style={imagePositionStyle(product.details)}
+          />
+        ) : (
+          <span className="grid h-full w-full place-items-center text-[11px]">🍫</span>
+        )}
+      </span>
+      <span className="truncate">{product.name}</span>
+      <span className="shrink-0 text-xs opacity-60">stock: {product.current_stock}</span>
+    </span>
+  );
+}
+
+export function PurchaseForm({
+  products,
+  suppliers,
+  initialProductId,
+}: {
+  products: Product[];
+  suppliers: Supplier[];
+  /** Preselected product — set when returning here from "Add a new product". */
+  initialProductId?: string;
+}) {
+  const router = useRouter();
+  const [form, setForm] = useState({
+    product_id:
+      (initialProductId && products.some((p) => p.id === initialProductId)
+        ? initialProductId
+        : products[0]?.id) ?? "",
+    quantity: "1",
+    unit_price: "",
+    supplier: "",
+    purchase_date: toISODate(new Date()),
+    notes: "",
+  });
+  const [saving, setSaving] = useState(false);
+
+  const product = products.find((p) => p.id === form.product_id);
+  const totalCost = useMemo(
+    () => (Number(form.quantity) || 0) * (Number(form.unit_price) || 0),
+    [form.quantity, form.unit_price]
+  );
+
+  // Live suggestions from the saved supplier directory.
+  const supplierMatches = useMemo(() => {
+    const q = form.supplier.trim().toLowerCase();
+    if (!q) return [];
+    return suppliers.filter((s) => s.name.toLowerCase().includes(q)).slice(0, 6);
+  }, [suppliers, form.supplier]);
+
+  // Exact (case-insensitive) hit — typing this won't create a new supplier.
+  const matchedSupplier = useMemo(() => {
+    const q = form.supplier.trim().toLowerCase();
+    return q ? suppliers.find((s) => s.name.toLowerCase() === q) : undefined;
+  }, [suppliers, form.supplier]);
+
+  // Increment/decrement a numeric field via the +/- buttons.
+  function bump(key: "quantity" | "unit_price", delta: number) {
+    setForm((f) => {
+      const cur = Number(f[key]) || 0;
+      const next =
+        key === "quantity"
+          ? Math.max(1, Math.floor(cur + delta))
+          : Math.max(0, Math.round((cur + delta) * 100) / 100);
+      return { ...f, [key]: String(next) };
+    });
+  }
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!product) return toast.error("Select a product.");
+    const qty = parseInt(form.quantity);
+    if (!qty || qty <= 0) return toast.error("Quantity must be positive.");
+
+    setSaving(true);
+    const supabase = createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    // A typed-in supplier that isn't on record yet gets saved to the Suppliers
+    // table so it shows up in the dropdown next time.
+    const supplierName = form.supplier.trim();
+    if (supplierName && !matchedSupplier) {
+      await createSupplierAction(supplierName);
+    }
+
+    const { error: pErr } = await supabase.from("purchases").insert({
+      product_id: product.id,
+      product_name: product.name,
+      quantity: qty,
+      unit_price: Number(form.unit_price) || 0,
+      total_cost: totalCost,
+      supplier: supplierName || null,
+      purchase_date: form.purchase_date,
+      notes: form.notes || null,
+      created_by: user?.id ?? null,
+    });
+
+    if (pErr) {
+      setSaving(false);
+      return toast.error(pErr.message);
+    }
+
+    // Add stock and roll the product's cost into a weighted moving average.
+    const { error: sErr } = await supabase.rpc("record_purchase_cost", {
+      p_product_id: product.id,
+      p_qty: qty,
+      p_unit_cost: Number(form.unit_price) || 0,
+    });
+    setSaving(false);
+    if (sErr) return toast.error(`Purchase saved, but stock update failed: ${sErr.message}`);
+
+    toast.success(`Added ${qty} to ${product.name} stock`);
+    // Stay on the page for the next entry — reset the inputs but keep the
+    // chosen supplier and date so back-to-back restocks are quick.
+    setForm((f) => ({
+      ...f,
+      quantity: "1",
+      unit_price: "",
+      notes: "",
+    }));
+    router.refresh();
+  }
+
+  const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement> | { target: { value: string } }) =>
+    setForm((f) => ({ ...f, [k]: e.target.value }));
+
+  return (
+    <form onSubmit={onSubmit} className="grid gap-4 lg:grid-cols-3">
+      <AdminCard title="Purchase Details" className="lg:col-span-2">
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="sm:col-span-2">
+            <Label className="text-gray-300">Product</Label>
+            <Select
+              value={form.product_id}
+              onChange={set("product_id")}
+              className={inputDark}
+              searchable
+              searchPlaceholder="Search products…"
+              required
+              footer={
+                // Not stocked yet? Create it and come straight back here with it
+                // already selected.
+                <Link
+                  href={`/admin/products/new?returnTo=${encodeURIComponent(NEW_PURCHASE_PATH)}`}
+                  className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm font-medium text-lime-400 transition hover:bg-lime-400 hover:text-black"
+                >
+                  <Plus className="h-4 w-4 shrink-0" />
+                  Add a new product
+                </Link>
+              }
+            >
+              {products.map((p) => (
+                // The label is a component, so give the search box plain text to match on.
+                <option key={p.id} value={p.id} data-search={p.name}>
+                  <ProductOption product={p} />
+                </option>
+              ))}
+            </Select>
+          </div>
+          <div>
+            <Label className="text-gray-300">Quantity</Label>
+            <div className="flex items-center gap-2">
+              <button type="button" onClick={() => bump("quantity", -1)} aria-label="Decrease quantity" className={stepperBtn}>
+                <Minus className="h-4 w-4" />
+              </button>
+              <Input type="number" min="1" required value={form.quantity} onChange={set("quantity")} className={`${inputDark} text-center`} />
+              <button type="button" onClick={() => bump("quantity", 1)} aria-label="Increase quantity" className={stepperBtn}>
+                <Plus className="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+          <div>
+            <Label className="text-gray-300">Unit cost (₹)</Label>
+            <div className="flex items-center gap-2">
+              <button type="button" onClick={() => bump("unit_price", -1)} aria-label="Decrease unit cost" className={stepperBtn}>
+                <Minus className="h-4 w-4" />
+              </button>
+              <Input type="number" step="0.01" min="0" required value={form.unit_price} onChange={set("unit_price")} className={`${inputDark} text-center`} />
+              <button type="button" onClick={() => bump("unit_price", 1)} aria-label="Increase unit cost" className={stepperBtn}>
+                <Plus className="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+          <div>
+            <Label className="text-gray-300">Supplier</Label>
+            <Autocomplete
+              value={form.supplier}
+              onChange={(v) => setForm((f) => ({ ...f, supplier: v }))}
+              items={supplierMatches}
+              getKey={(s) => s.id}
+              getLabel={(s) => s.name}
+              onPick={(s) => setForm((f) => ({ ...f, supplier: s.name }))}
+              placeholder="Type a supplier…"
+              inputClassName={inputDark}
+            />
+            {form.supplier.trim() && !matchedSupplier && (
+              <p className="mt-1.5 text-xs text-emerald-400">New supplier — saved on purchase.</p>
+            )}
+          </div>
+          <div>
+            <Label className="text-gray-300">Purchase date</Label>
+            <DatePicker value={form.purchase_date} onChange={(v) => setForm((f) => ({ ...f, purchase_date: v }))} />
+          </div>
+          <div className="sm:col-span-2">
+            <Label className="text-gray-300">Notes</Label>
+            <Textarea value={form.notes} onChange={set("notes")} className={inputDark} rows={2} />
+          </div>
+        </div>
+      </AdminCard>
+
+      <div className="space-y-4">
+        <AdminCard title="Summary">
+          <div className="space-y-2 text-sm">
+            <div className="flex justify-between text-gray-400">
+              <span>Product</span>
+              <span className="text-white">{product?.name ?? "—"}</span>
+            </div>
+            <div className="flex justify-between text-gray-400">
+              <span>New stock</span>
+              <span className="text-white">
+                {(product?.current_stock ?? 0) + (parseInt(form.quantity) || 0)}
+              </span>
+            </div>
+            <div className="flex justify-between border-t border-[#222] pt-2 text-base font-bold text-white">
+              <span>Total cost</span>
+              <span>{formatCurrency(totalCost)}</span>
+            </div>
+          </div>
+        </AdminCard>
+        <Button type="submit" loading={saving} variant="dark" className="w-full">
+          Save purchase & restock
+        </Button>
+      </div>
+    </form>
+  );
+}

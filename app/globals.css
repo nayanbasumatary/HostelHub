@@ -1,0 +1,216 @@
+@import "tailwindcss";
+
+/* Class-based dark variant (the app is forced dark via <html class="dark">) */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+
+  /* Brand = FlopShop yellow. The `lime-*` ramp is remapped to a warm yellow so
+     every brand accent stays consistent. */
+  --color-lime-50: #fffbeb;
+  --color-lime-100: #fef3c7;
+  --color-lime-200: #fde68a;
+  --color-lime-300: #fcd34d;
+  --color-lime-400: #f5c518;
+  --color-lime-500: #f5c518;
+  --color-lime-600: #d9a90b;
+  --color-lime-700: #b8890a;
+  --color-lime-800: #854d0e;
+  --color-lime-900: #713f12;
+}
+
+html,
+body {
+  min-height: 100%;
+  background: #000000;
+  color: #ffffff;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+::selection {
+  background: #f5c518;
+  color: #000000;
+}
+
+/* ============ Custom scrollbar (thin, yellow-themed) ============ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(245, 197, 24, 0.35) transparent;
+}
+*::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(245, 197, 24, 0.35);
+  border-radius: 9999px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(245, 197, 24, 0.55);
+}
+
+/* ============ Surfaces (flat, dark — Waura style) ============ */
+.glass {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.glass-strong {
+  background: #0c0c0c;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 24px 60px -18px rgba(0, 0, 0, 0.8);
+}
+/* Bright "lens" pill used for the active toggle + product stepper */
+.glass-lens {
+  background: #ffffff;
+  border: 1px solid #ffffff;
+  box-shadow: 0 4px 14px -4px rgba(0, 0, 0, 0.6);
+}
+.glass-line {
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+/* ============ Numbers that never overflow their card ============
+   Amounts and counts are always printed in full — never rounded, shortened or
+   truncated — so the *card* has to adapt to the number instead. Each stat card
+   is a size-query container; its value scales with the card's own width (not
+   the viewport, so it works the same in a 2-up phone grid as in a 6-up desktop
+   one) and wraps as a last resort rather than spilling over the edge. */
+.stat-card {
+  container-type: inline-size;
+}
+.stat-value {
+  /* ~text-2xl on a roomy card, shrinking to a readable minimum on a narrow one. */
+  font-size: clamp(1rem, 13cqi, 1.5rem);
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+/* Bigger variant for hero figures that were text-3xl. */
+.stat-value-lg {
+  font-size: clamp(1.125rem, 16cqi, 1.875rem);
+  line-height: 1.1;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A "label ……… amount" row. The label gives up space first (it ellipsises);
+   the amount keeps its width and, if even that doesn't fit, wraps inside the
+   row instead of pushing past the card. */
+.num-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.num-row > :first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.num-row > :last-child {
+  flex: 0 0 auto;
+  max-width: 100%;
+  text-align: right;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Standalone figure: keeps digits aligned and stops a long amount from being
+   broken across lines inside a scrollable table cell. */
+.num {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Hide scrollbars on horizontal scrollers */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* ============ Marquee announcement bar ============ */
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+.marquee-track {
+  display: inline-flex;
+  white-space: nowrap;
+  animation: marquee 22s linear infinite;
+}
+
+/* Order-complete animation */
+@keyframes pop-in {
+  0% { transform: scale(0.4); opacity: 0; }
+  60% { transform: scale(1.1); }
+  100% { transform: scale(1); opacity: 1; }
+}
+@keyframes ring-pulse {
+  0% { transform: scale(0.8); opacity: 0.7; }
+  100% { transform: scale(2.2); opacity: 0; }
+}
+.animate-pop-in { animation: pop-in 0.5s cubic-bezier(0.22, 1, 0.36, 1) both; }
+.animate-ring { animation: ring-pulse 1.4s ease-out infinite; }
+
+/* New-order toast: yellow progress bar that drains over its 5s lifetime. */
+@keyframes toast-progress {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+.toast-progress { animation: toast-progress 5000ms linear forwards; transform-origin: left; }
+
+/* The print portal is the dedicated print source — never shown on screen. */
+@media screen {
+  .print-portal { display: none !important; }
+}
+
+/* Print: render ONLY the invoice (from the body-level .print-portal) on a white
+   A4 page. Hiding every other body child keeps the document exactly one invoice
+   tall, so the tall admin/store UI can't spill a blank trailing page. */
+@media print {
+  @page { size: A4; margin: 14mm; }
+  /* Force a white page so the dark admin/store UI doesn't bleed a black page. */
+  html, body { background: #fff !important; height: auto !important; }
+  /* Hide the whole app shell (and toaster); show only the portal. */
+  body > *:not(.print-portal) { display: none !important; }
+  .print-portal { display: block !important; }
+  .print-area {
+    margin: 0 auto;
+    padding: 0;
+    width: 100%;
+    max-width: 170mm;
+    background: #fff !important;
+    color: #111 !important;
+  }
+  .no-print { display: none !important; }
+}
+
+/* No native UI inside inputs: strip the number-input spinner arrows globally. */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}

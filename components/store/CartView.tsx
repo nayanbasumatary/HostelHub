@@ -1,0 +1,211 @@
+"use client";
+
+import Image from "next/image";
+import Link from "next/link";
+import { useEffect } from "react";
+import { useRouter } from "next/navigation";
+import { Minus, Plus, Trash2, ShoppingBag } from "lucide-react";
+import { useCart } from "@/lib/hooks/useCart";
+import { formatCurrency } from "@/lib/utils/formatters";
+import { deliverySplit, freeDeliveryPromo } from "@/lib/utils/orderHelpers";
+import { Button } from "@/components/ui/button";
+import type { OrderType, SettingsMap } from "@/lib/types";
+import toast from "react-hot-toast";
+import { useSettings } from "@/lib/hooks/useSettings";
+
+export function CartView({ settings }: { settings: SettingsMap }) {
+  const router = useRouter();
+  const hydrated = useCart((s) => s.hydrated);
+  const items = useCart((s) => s.items);
+  const orderType = useCart((s) => s.orderType);
+  const setOrderType = useCart((s) => s.setOrderType);
+  const increment = useCart((s) => s.increment);
+  const decrement = useCart((s) => s.decrement);
+  const removeItem = useCart((s) => s.removeItem);
+
+  const currency = settings.currency_symbol ?? "₹";
+  const deliveryFee = Number(settings.delivery_fee ?? 10);
+  const deliveryShare = Number(settings.delivery_person_share ?? 8);
+  const adminShare = Number(settings.admin_delivery_share ?? 2);
+  const { isOpen } = useSettings();
+
+  // Which order types the admin has enabled (defaults to both).
+  const enabledTypes = ((settings.order_types_enabled ?? "pickup,delivery").split(",").filter(Boolean) as OrderType[]);
+  const canPickup = enabledTypes.includes("pickup");
+  const canDelivery = enabledTypes.includes("delivery");
+
+  // Keep the cart's order type valid for what's enabled.
+  useEffect(() => {
+    if (!enabledTypes.includes(orderType) && enabledTypes.length > 0) {
+      setOrderType(enabledTypes[0]);
+    }
+  }, [enabledTypes, orderType, setOrderType]);
+
+  if (!hydrated) return <div className="p-10 text-center text-stone-400">Loading cart...</div>;
+
+  if (items.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-24 text-center">
+        <ShoppingBag className="mb-3 h-12 w-12 text-stone-300 dark:text-stone-600" />
+        <p className="text-stone-500 dark:text-stone-400">Your cart is empty.</p>
+        <Link href="/" className="mt-4">
+          <Button>Browse products</Button>
+        </Link>
+      </div>
+    );
+  }
+
+  const subtotal = items.reduce((s, i) => s + i.price * i.quantity, 0);
+  // Mirrors the server's split exactly (createOrder is the source of truth), so
+  // the promo shown here is the promo that gets charged.
+  const split = deliverySplit(settings, orderType, subtotal);
+  const fee = split.delivery_fee;
+  const total = subtotal + fee;
+
+  const promo = freeDeliveryPromo(settings);
+  const freeDelivery = orderType === "delivery" && promo.live && subtotal >= promo.min;
+  const awayFromFree = promo.live ? promo.min - subtotal : 0;
+
+  return (
+    <div className="mx-auto max-w-2xl px-4 py-5">
+      <h1 className="mb-4 text-xl font-extrabold text-stone-950 dark:text-white">Your Cart</h1>
+
+      <div className="space-y-3">
+        {items.map((item) => (
+          <div key={item.id} className="flex items-center gap-3 rounded-lg border border-black/10 bg-white p-3 shadow-sm dark:border-white/10 dark:bg-stone-900">
+            <div className="relative h-14 w-14 shrink-0 overflow-hidden rounded-lg bg-stone-50 dark:bg-stone-800">
+              {item.image_url ? (
+                <Image src={item.image_url} alt={item.name} fill className="object-cover" sizes="56px" />
+              ) : (
+                <div className="flex h-full items-center justify-center text-xl">🍫</div>
+              )}
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-semibold text-stone-950 dark:text-white">{item.name}</p>
+              <p className="num text-sm text-stone-500 dark:text-stone-400">{formatCurrency(item.price, currency)}</p>
+            </div>
+            <div className="flex shrink-0 items-center gap-2 rounded-lg bg-lime-500 text-stone-950">
+              <button onClick={() => decrement(item.id)} className="grid h-7 w-7 place-items-center">
+                <Minus className="h-3 w-3" />
+              </button>
+              <span className="min-w-4 text-center text-sm font-bold">{item.quantity}</span>
+              <button
+                onClick={() => {
+                  if (!isOpen) return toast.error("The shop is currently closed.");
+                  increment(item.id);
+                }}
+                disabled={item.quantity >= item.current_stock || !isOpen}
+                className="grid h-7 w-7 place-items-center disabled:opacity-40"
+              >
+                <Plus className="h-3 w-3" />
+              </button>
+            </div>
+            <button onClick={() => removeItem(item.id)} className="p-1 text-stone-400 hover:text-red-500">
+              <Trash2 className="h-4 w-4" />
+            </button>
+          </div>
+        ))}
+      </div>
+
+      {/* Order type — shows only the enabled options */}
+      <div className="mt-6">
+        <p className="mb-2 text-sm font-semibold text-stone-700 dark:text-stone-300">Order Type</p>
+        {canPickup && canDelivery ? (
+          <div className="grid grid-cols-2 gap-3">
+            <button
+              type="button"
+              onClick={() => setOrderType("pickup")}
+              className={`rounded-lg border p-3 text-left text-sm ${
+                orderType === "pickup"
+                  ? "border-lime-500 bg-lime-50 dark:bg-lime-400/10"
+                  : "border-black/10 bg-white dark:border-white/10 dark:bg-stone-900"
+              }`}
+            >
+              <p className="font-semibold text-stone-950 dark:text-white">Pickup</p>
+              <p className="text-xs text-stone-500 dark:text-stone-400">Collect yourself · Free</p>
+            </button>
+            <button
+              type="button"
+              onClick={() => setOrderType("delivery")}
+              className={`rounded-lg border p-3 text-left text-sm ${
+                orderType === "delivery"
+                  ? "border-lime-500 bg-lime-50 dark:bg-lime-400/10"
+                  : "border-black/10 bg-white dark:border-white/10 dark:bg-stone-900"
+              }`}
+            >
+              <p className="font-semibold text-stone-950 dark:text-white">Delivery</p>
+              <p className="text-xs text-stone-500 dark:text-stone-400">To your room · +{formatCurrency(deliveryFee, currency)}</p>
+            </button>
+          </div>
+        ) : (
+          <div className="rounded-lg border border-lime-500 bg-lime-50 p-3 text-sm dark:bg-lime-400/10">
+            <p className="font-semibold text-stone-950 dark:text-white capitalize">{orderType}</p>
+            <p className="text-xs text-stone-500 dark:text-stone-400">
+              {orderType === "delivery"
+                ? `To your room · +${formatCurrency(deliveryFee, currency)}`
+                : "Collect yourself · Free"}
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* Free-delivery promo: how close this basket is, or that it made it. */}
+      {promo.live && canDelivery && (
+        <div
+          className={`mt-4 rounded-lg border px-3 py-2.5 text-sm ${
+            awayFromFree <= 0
+              ? "border-lime-500/40 bg-lime-50 text-lime-800 dark:bg-lime-400/10 dark:text-lime-300"
+              : "border-black/10 bg-stone-50 text-stone-600 dark:border-white/10 dark:bg-white/5 dark:text-stone-300"
+          }`}
+        >
+          {awayFromFree <= 0 ? (
+            <>🎉 Your order gets <span className="font-semibold">free delivery</span>.</>
+          ) : (
+            <>
+              Add <span className="font-semibold">{formatCurrency(awayFromFree, currency)}</span> more
+              for free delivery on orders over {formatCurrency(promo.min, currency)}.
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Summary */}
+      <div className="mt-6 rounded-lg border border-black/10 bg-white p-4 shadow-sm dark:border-white/10 dark:bg-stone-900">
+        <div className="num-row text-sm text-stone-600 dark:text-stone-400">
+          <span>Subtotal</span>
+          <span>{formatCurrency(subtotal, currency)}</span>
+        </div>
+        {orderType === "delivery" && (
+          <>
+            <div className="num-row mt-2 text-sm text-stone-600 dark:text-stone-400">
+              <span>Delivery fee</span>
+              {freeDelivery ? (
+                <span className="font-semibold text-lime-600 dark:text-lime-400">
+                  <s className="mr-1.5 font-normal text-stone-400 dark:text-stone-500">
+                    {formatCurrency(deliveryFee, currency)}
+                  </s>
+                  FREE
+                </span>
+              ) : (
+                <span>{formatCurrency(deliveryFee, currency)}</span>
+              )}
+            </div>
+            {!freeDelivery && (
+              <p className="mt-0.5 break-words text-xs text-stone-400 dark:text-stone-500">
+                {formatCurrency(deliveryShare, currency)} delivery person + {formatCurrency(adminShare, currency)} shop
+              </p>
+            )}
+          </>
+        )}
+        <div className="num-row mt-3 border-t border-black/10 pt-3 text-base font-extrabold text-stone-950 dark:border-white/10 dark:text-white">
+          <span>Total</span>
+          <span>{formatCurrency(total, currency)}</span>
+        </div>
+      </div>
+
+      <Button type="button" className="mt-5 w-full" size="lg" onClick={() => router.push("/checkout")} disabled={!isOpen}>
+        {isOpen ? "Proceed to Checkout" : "Shop is closed"}
+      </Button>
+    </div>
+  );
+}

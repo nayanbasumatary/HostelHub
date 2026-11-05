@@ -1,0 +1,659 @@
+"use client";
+
+import { useCallback, useMemo, useState } from "react";
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+  PieChart,
+  Pie,
+  Cell,
+  Legend,
+} from "recharts";
+import Link from "next/link";
+import { Download, ChevronRight } from "lucide-react";
+import { StatCard, AdminCard } from "@/components/admin/StatCard";
+import { Button } from "@/components/ui/button";
+import { DatePicker } from "@/components/ui/date-picker";
+import { Pagination, usePagination } from "@/components/ui/pagination";
+import { TableToolbar, SortHeader } from "@/components/admin/TableControls";
+import { useTableControls, byText, byNum } from "@/lib/hooks/useTableControls";
+import { formatCurrency, istDateString, paymentSplit } from "@/lib/utils/formatters";
+import { distributeProfit } from "@/lib/utils/shareholders";
+import { usePersistentState } from "@/lib/hooks/usePersistentState";
+import type { CreditSources } from "@/lib/utils/income";
+import { MethodTransfers } from "@/components/admin/MethodTransfers";
+import type { Category, MethodTransfer, Product, Purchase, SettingsMap, Shareholder } from "@/lib/types";
+
+interface ReportOrder {
+  id: string;
+  status: string;
+  order_type: "pickup" | "delivery";
+  created_at: string;
+  subtotal: number;
+  total_amount: number;
+  delivery_fee: number;
+  delivery_person_earning: number;
+  admin_delivery_earning: number;
+  payment_method: string;
+  paid_cash: number;
+  paid_upi: number;
+  order_items: {
+    quantity: number;
+    total_price: number;
+    product_name: string;
+    cost_price: number;
+    product: { category_id: string | null } | null;
+  }[];
+}
+
+const tabs = ["Sales", "Profit", "Inventory"] as const;
+type Tab = (typeof tabs)[number];
+
+const PIE_COLORS = ["#f59e0b", "#3b82f6", "#ef4444", "#10b981", "#8b5cf6", "#ec4899"];
+const INCOME_COLORS: Record<string, string> = {
+  Cash: "#10b981",
+  UPI: "#3b82f6",
+  "Bank Transfer": "#f59e0b",
+  "Wallet/Credit": "#a3e635",
+  Other: "#6b7280",
+};
+const tooltipStyle = { backgroundColor: "#0a0a0a", border: "1px solid #333", borderRadius: 8, fontSize: 12 };
+
+export function ReportsView({
+  orders,
+  products,
+  purchases,
+  categories,
+  settings,
+  shareholders = [],
+  cutoffById = {},
+  transfers = [],
+  creditSources = { byOrder: {}, fallback: { cash: 0, upi: 0, bank: 0, other: 1 } },
+}: {
+  orders: ReportOrder[];
+  products: Product[];
+  purchases: Purchase[];
+  categories: Category[];
+  settings: SettingsMap;
+  /** Active shareholder roster, used to break down the profit pool. */
+  shareholders?: Shareholder[];
+  /** Each shareholder's last settlement cutoff (id → ISO), for outstanding profit. */
+  cutoffById?: Record<string, string | null>;
+  /** Manual income reclassifications between payment methods. */
+  transfers?: MethodTransfer[];
+  /** Funding mix behind each credit-paid order, for the "by source" view. */
+  creditSources?: CreditSources;
+}) {
+  const currency = settings.currency_symbol ?? "₹";
+  const [tab, setTab] = useState<Tab>("Sales");
+  // "paid" shows wallet spend as its own bucket (what the till saw); "source"
+  // re-attributes it to the cash/UPI that funded the wallet in the first place.
+  const [incomeView, setIncomeView] = usePersistentState<"paid" | "source">(
+    "admin:reports:incomeView",
+    "paid"
+  );
+
+  // Default the range to start at the very first sale on record (so it always
+  // covers all history), falling back to 29 days ago when there are no orders.
+  const [from, setFrom] = useState(() => {
+    let earliest = "";
+    for (const o of orders) {
+      const day = istDateString(o.created_at);
+      if (!earliest || day < earliest) earliest = day;
+    }
+    if (earliest) return earliest;
+    const d = new Date();
+    d.setDate(d.getDate() - 29);
+    return istDateString(d);
+  });
+  // End the range at "today" in IST so the latest sales are always included.
+  const [to, setTo] = useState(istDateString());
+
+  const catName = useMemo(
+    () => new Map(categories.map((c) => [c.id, `${c.icon} ${c.name}`])),
+    [categories]
+  );
+
+  const inRange = useCallback(
+    (d: string) => {
+      const day = istDateString(d);
+      return day >= from && day <= to;
+    },
+    [from, to]
+  );
+
+  const validOrders = useMemo(
+    () => orders.filter((o) => o.status !== "cancelled" && inRange(o.created_at)),
+    [orders, inRange]
+  );
+  const rangePurchases = useMemo(
+    () => purchases.filter((p) => inRange(p.purchase_date)),
+    [purchases, inRange]
+  );
+
+  // ---- Sales metrics ----
+  const totalRevenue = validOrders.reduce((s, o) => s + Number(o.total_amount), 0);
+  const totalItems = validOrders.reduce(
+    (s, o) => s + o.order_items.reduce((a, it) => a + it.quantity, 0),
+    0
+  );
+  const aov = validOrders.length ? totalRevenue / validOrders.length : 0;
+
+  // Income by payment method — split orders contribute to both cash & UPI, then
+  // manual transfers (within range) reclassify amounts between methods.
+  //
+  // `bySource` is the same total, except wallet spend is pushed back onto the
+  // cash/UPI that funded that wallet. Top-ups are never booked as income when
+  // they happen (only when spent), so this reclassifies rather than double-counts.
+  const { income, incomeBySource } = useMemo(() => {
+    const paid = { cash: 0, upi: 0, bank: 0, credit: 0, other: 0 };
+    const source = { cash: 0, upi: 0, bank: 0, credit: 0, other: 0 };
+
+    for (const o of validOrders) {
+      const s = paymentSplit(o);
+      for (const acc of [paid, source]) {
+        acc.cash += s.cash;
+        acc.upi += s.upi;
+        acc.bank += s.bank;
+        acc.other += s.other;
+      }
+      paid.credit += s.credit;
+      if (s.credit > 0) {
+        const mix = creditSources.byOrder[o.id] ?? creditSources.fallback;
+        source.cash += s.credit * mix.cash;
+        source.upi += s.credit * mix.upi;
+        source.bank += s.credit * mix.bank;
+        source.other += s.credit * mix.other;
+      }
+    }
+
+    for (const t of transfers) {
+      if (!inRange(t.date)) continue;
+      for (const leg of t.legs ?? []) {
+        if (leg.method in paid) {
+          paid[leg.method] += Number(leg.delta);
+          source[leg.method] += Number(leg.delta);
+        }
+      }
+    }
+    return { income: paid, incomeBySource: source };
+  }, [validOrders, transfers, inRange, creditSources]);
+
+  const shownIncome = incomeView === "source" ? incomeBySource : income;
+  const incomePie = useMemo(
+    () =>
+      [
+        { name: "Cash", value: shownIncome.cash },
+        { name: "UPI", value: shownIncome.upi },
+        { name: "Bank Transfer", value: shownIncome.bank },
+        { name: "Wallet/Credit", value: shownIncome.credit },
+        { name: "Other", value: shownIncome.other },
+      ].filter((d) => d.value > 0),
+    [shownIncome]
+  );
+
+  const dailySeries = useMemo(() => {
+    const map = new Map<string, { revenue: number; orders: number }>();
+    validOrders.forEach((o) => {
+      const key = istDateString(o.created_at);
+      const e = map.get(key) ?? { revenue: 0, orders: 0 };
+      e.revenue += Number(o.total_amount);
+      e.orders += 1;
+      map.set(key, e);
+    });
+    return Array.from(map.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, v]) => ({ date: date.slice(5), ...v }));
+  }, [validOrders]);
+
+  const productAgg = useMemo(() => {
+    const map = new Map<string, { name: string; qty: number; revenue: number; cost: number }>();
+    validOrders.forEach((o) =>
+      o.order_items.forEach((it) => {
+        const e = map.get(it.product_name) ?? { name: it.product_name, qty: 0, revenue: 0, cost: 0 };
+        e.qty += it.quantity;
+        e.revenue += Number(it.total_price);
+        e.cost += it.quantity * Number(it.cost_price ?? 0);
+        map.set(it.product_name, e);
+      })
+    );
+    return Array.from(map.values());
+  }, [validOrders]);
+
+  const topProducts = [...productAgg].sort((a, b) => b.qty - a.qty).slice(0, 8);
+
+  const categoryAgg = useMemo(() => {
+    const map = new Map<string, number>();
+    validOrders.forEach((o) =>
+      o.order_items.forEach((it) => {
+        const id = it.product?.category_id ?? "other";
+        map.set(id, (map.get(id) ?? 0) + Number(it.total_price));
+      })
+    );
+    return Array.from(map.entries()).map(([id, value]) => ({ name: catName.get(id) ?? "Other", value }));
+  }, [validOrders, catName]);
+
+  // ---- Profit metrics ----
+  const productRevenue = validOrders.reduce((s, o) => s + Number(o.subtotal), 0);
+  const cogs = productAgg.reduce((s, p) => s + p.cost, 0);
+  const grossProfit = productRevenue - cogs;
+  const purchaseCost = rangePurchases.reduce((s, p) => s + Number(p.total_cost), 0);
+  const deliveryTotals = validOrders.reduce(
+    (acc, o) => {
+      acc.fee += Number(o.delivery_fee);
+      acc.person += Number(o.delivery_person_earning);
+      acc.admin += Number(o.admin_delivery_earning);
+      return acc;
+    },
+    { fee: 0, person: 0, admin: 0 }
+  );
+  // Shareholder profit pool — item margin + the shop's delivery share, owned in
+  // full by the shareholders. After a settlement, only orders created since its
+  // cutoff count, so the card reflects the OUTSTANDING (unsettled) balance.
+  const profitSplit = distributeProfit(validOrders, shareholders, cutoffById);
+  const profitPool = profitSplit.reduce((s, d) => s + d.amount, 0);
+  const netProfit = grossProfit + deliveryTotals.admin;
+
+  // Profit/Loss per product — searchable, sortable, paginated.
+  const profitRows = useMemo(
+    () => productAgg.map((p) => ({ ...p, profit: p.revenue - p.cost })),
+    [productAgg]
+  );
+  const pfCtl = useTableControls(profitRows, {
+    searchFields: (p) => [p.name],
+    sorters: {
+      name: byText((p) => p.name),
+      revenue: byNum((p) => p.revenue),
+      cost: byNum((p) => p.cost),
+      profit: byNum((p) => p.profit),
+    },
+    initialSort: "profit",
+    initialDir: "desc",
+  });
+  const pfPag = usePagination(pfCtl.rows);
+
+  // ---- Inventory ----
+  const stockValue = products.reduce((s, p) => s + p.current_stock * Number(p.cost_price), 0);
+  const lowStock = products.filter((p) => p.current_stock <= p.minimum_stock);
+
+  // Current stock levels — searchable, sortable, paginated.
+  const stockRows = useMemo(
+    () =>
+      products.map((p) => ({
+        id: p.id,
+        name: p.name,
+        stock: p.current_stock,
+        min: p.minimum_stock,
+        cost: Number(p.cost_price),
+        value: p.current_stock * Number(p.cost_price),
+      })),
+    [products]
+  );
+  const invCtl = useTableControls(stockRows, {
+    searchFields: (p) => [p.name],
+    sorters: {
+      name: byText((p) => p.name),
+      stock: byNum((p) => p.stock),
+      min: byNum((p) => p.min),
+      cost: byNum((p) => p.cost),
+      value: byNum((p) => p.value),
+    },
+    initialSort: "name",
+    initialDir: "asc",
+  });
+  const invPag = usePagination(invCtl.rows);
+
+  function exportCSV() {
+    const rows = [
+      ["Date", "Orders", "Revenue"],
+      ...dailySeries.map((d) => [d.date, String(d.orders), String(d.revenue)]),
+    ];
+    const csv = rows.map((r) => r.join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `flopshop-sales-${from}_to_${to}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <div>
+      <div className="mb-4 flex flex-col items-center gap-3 lg:flex-row lg:justify-between">
+        {/* Tabs scroll sideways on a phone instead of squeezing off-screen. */}
+        <div className="no-scrollbar -mx-1 flex w-full justify-start gap-2 overflow-x-auto px-1 lg:w-auto lg:justify-center">
+          {tabs.map((t) => (
+            <button
+              key={t}
+              onClick={() => setTab(t)}
+              className={`shrink-0 whitespace-nowrap rounded-lg px-4 py-2 text-sm font-medium transition ${
+                tab === t ? "bg-white text-black" : "bg-[#1a1a1a] text-gray-400 hover:text-white"
+              }`}
+            >
+              {t}
+            </button>
+          ))}
+        </div>
+        <div className="flex w-full items-center justify-center gap-2 lg:w-auto">
+          <DatePicker value={from} onChange={setFrom} className="min-w-0 flex-1 sm:w-40 sm:flex-none" />
+          <span className="shrink-0 text-white/40">→</span>
+          <DatePicker value={to} onChange={setTo} className="min-w-0 flex-1 sm:w-40 sm:flex-none" />
+        </div>
+      </div>
+
+      {tab === "Sales" && (
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <StatCard label="Total Orders" value={validOrders.length} />
+            <StatCard label="Revenue" value={formatCurrency(totalRevenue, currency)} />
+            <StatCard label="Items Sold" value={totalItems} />
+            <StatCard label="Avg Order Value" value={formatCurrency(aov, currency)} />
+          </div>
+
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <StatCard label="Cash Income" value={formatCurrency(income.cash, currency)} />
+            <StatCard label="UPI Income" value={formatCurrency(income.upi, currency)} />
+            <StatCard label="Wallet/Credit" value={formatCurrency(income.credit, currency)} hint="Paid from store credit" />
+            <StatCard label="Bank / Other" value={formatCurrency(income.bank + income.other, currency)} />
+          </div>
+
+          <AdminCard
+            title="Income by Payment Method"
+            action={
+              <div className="flex rounded-lg border border-black/10 p-0.5 text-xs dark:border-white/10">
+                {(
+                  [
+                    ["paid", "As paid"],
+                    ["source", "By source"],
+                  ] as const
+                ).map(([key, label]) => (
+                  <button
+                    key={key}
+                    onClick={() => setIncomeView(key)}
+                    className={`rounded-md px-2.5 py-1 font-medium transition ${
+                      incomeView === key
+                        ? "bg-yellow-400 text-black"
+                        : "text-stone-500 hover:text-stone-800 dark:hover:text-stone-200"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            }
+          >
+            {incomeView === "source" && (
+              <p className="mb-3 text-xs text-stone-500 dark:text-stone-400">
+                Wallet spend is counted against the cash/UPI that funded it, so it has no slice of
+                its own. Totals match the “As paid” view.
+              </p>
+            )}
+            {incomePie.length === 0 ? (
+              <p className="py-10 text-center text-sm text-gray-500">No income in range.</p>
+            ) : (
+              <div className="grid items-center gap-4 sm:grid-cols-2">
+                <ResponsiveContainer width="100%" height={220}>
+                  <PieChart>
+                    <Pie data={incomePie} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={70}>
+                      {incomePie.map((d) => (
+                        <Cell key={d.name} fill={INCOME_COLORS[d.name] ?? "#8b5cf6"} />
+                      ))}
+                    </Pie>
+                    <Tooltip contentStyle={tooltipStyle} formatter={(v) => formatCurrency(Number(v), currency)} />
+                    <Legend wrapperStyle={{ fontSize: 12 }} />
+                  </PieChart>
+                </ResponsiveContainer>
+                <div className="space-y-2 text-sm">
+                  <Line label="Cash" value={formatCurrency(shownIncome.cash, currency)} />
+                  <Line label="UPI" value={formatCurrency(shownIncome.upi, currency)} />
+                  {shownIncome.credit > 0 && (
+                    <Line label="Wallet/Credit" value={formatCurrency(shownIncome.credit, currency)} />
+                  )}
+                  {shownIncome.bank > 0 && (
+                    <Line label="Bank Transfer" value={formatCurrency(shownIncome.bank, currency)} />
+                  )}
+                  {shownIncome.other > 0 && (
+                    <Line label="Other" value={formatCurrency(shownIncome.other, currency)} />
+                  )}
+                </div>
+              </div>
+            )}
+          </AdminCard>
+
+          <MethodTransfers transfers={transfers} currency={currency} />
+
+          <AdminCard
+            title="Daily Sales"
+            action={
+              <Button size="sm" variant="outline" onClick={exportCSV} className="border-[#333] text-gray-300">
+                <Download className="h-4 w-4" /> CSV
+              </Button>
+            }
+          >
+            {dailySeries.length === 0 ? (
+              <p className="py-10 text-center text-sm text-gray-500">No sales in range.</p>
+            ) : (
+              <ResponsiveContainer width="100%" height={260}>
+                <BarChart data={dailySeries} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#222" />
+                  <XAxis dataKey="date" stroke="#666" fontSize={11} />
+                  <YAxis stroke="#666" fontSize={11} />
+                  <Tooltip contentStyle={tooltipStyle} />
+                  <Bar dataKey="revenue" fill="#6366f1" radius={[4, 4, 0, 0]} name="Revenue ₹" />
+                </BarChart>
+              </ResponsiveContainer>
+            )}
+          </AdminCard>
+
+          <div className="grid gap-4 lg:grid-cols-2">
+            <AdminCard title="Top Selling Products">
+              <div className="-mx-1 overflow-x-auto px-1">
+                <table className="w-full min-w-[20rem] text-sm text-gray-300">
+                  <thead>
+                    <tr className="whitespace-nowrap text-left text-xs text-gray-500">
+                      <th className="pb-2">Product</th>
+                      <th className="pb-2 text-right">Qty</th>
+                      <th className="pb-2 text-right">Revenue</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {topProducts.length === 0 && (
+                      <tr>
+                        <td colSpan={3} className="py-6 text-center text-gray-500">No data</td>
+                      </tr>
+                    )}
+                    {topProducts.map((p) => (
+                      <tr key={p.name} className="border-t border-[#222]">
+                        <td className="py-2 pr-3">{p.name}</td>
+                        <td className="num py-2 pl-3 text-right">{p.qty}</td>
+                        <td className="num py-2 pl-3 text-right">{formatCurrency(p.revenue, currency)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </AdminCard>
+
+            <AdminCard title="Sales by Category">
+              {categoryAgg.length === 0 ? (
+                <p className="py-10 text-center text-sm text-gray-500">No data</p>
+              ) : (
+                <ResponsiveContainer width="100%" height={240}>
+                  <PieChart>
+                    <Pie data={categoryAgg} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={80} label>
+                      {categoryAgg.map((_, i) => (
+                        <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
+                      ))}
+                    </Pie>
+                    <Tooltip contentStyle={tooltipStyle} />
+                    <Legend wrapperStyle={{ fontSize: 12 }} />
+                  </PieChart>
+                </ResponsiveContainer>
+              )}
+            </AdminCard>
+          </div>
+        </div>
+      )}
+
+      {tab === "Profit" && (
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <StatCard label="Product Revenue" value={formatCurrency(productRevenue, currency)} />
+            <StatCard label="Cost of Goods" value={formatCurrency(cogs, currency)} />
+            <StatCard label="Gross Profit" value={formatCurrency(grossProfit, currency)} hint="Revenue − COGS" />
+            <StatCard label="Net Profit" value={formatCurrency(netProfit, currency)} hint="+ admin delivery" />
+          </div>
+
+          <div className="grid gap-4 lg:grid-cols-3">
+            <AdminCard title="Delivery Earnings">
+              <div className="space-y-2 text-sm">
+                <Line label="Total delivery fees" value={formatCurrency(deliveryTotals.fee, currency)} />
+                <Line label="Delivery persons earned" value={formatCurrency(deliveryTotals.person, currency)} />
+                <Line label="Shop (admin share)" value={formatCurrency(deliveryTotals.admin, currency)} />
+              </div>
+            </AdminCard>
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:col-span-2">
+              <AdminCard title="Purchase Cost" className="stat-card">
+                <p className="stat-value font-bold text-white">{formatCurrency(purchaseCost, currency)}</p>
+                <p className="mt-1 break-words text-xs text-gray-500">{rangePurchases.length} purchase records</p>
+              </AdminCard>
+              <Link href="/admin/shareholders" className="block">
+                <AdminCard title="Shareholder Split" className="stat-card">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="stat-value font-bold text-white">{formatCurrency(profitPool, currency)}</p>
+                      <div className="mt-1 space-y-0.5 text-xs text-gray-500">
+                        {profitSplit.map((sh) => (
+                          <p key={sh.id} className="break-words">
+                            · {sh.name} {Number(sh.share_percent)}% — {formatCurrency(sh.amount, currency)}
+                          </p>
+                        ))}
+                        <p>· outstanding, unsettled</p>
+                      </div>
+                    </div>
+                    <ChevronRight className="h-4 w-4 shrink-0 text-gray-500" />
+                  </div>
+                </AdminCard>
+              </Link>
+            </div>
+          </div>
+
+          <AdminCard title="Profit / Loss per Product">
+            <TableToolbar
+              query={pfCtl.query}
+              onQuery={pfCtl.setQuery}
+              placeholder="Search product…"
+              showDateRange={false}
+            />
+            <div className="-mx-1 overflow-x-auto px-1">
+              <table className="w-full min-w-[30rem] text-sm text-gray-300">
+                <thead>
+                  <tr className="whitespace-nowrap text-left text-xs text-gray-500">
+                    <SortHeader label="Product" sortKey="name" activeKey={pfCtl.sortKey} dir={pfCtl.dir} onSort={pfCtl.toggleSort} className="!p-0 !pb-2" />
+                    <SortHeader label="Revenue" sortKey="revenue" activeKey={pfCtl.sortKey} dir={pfCtl.dir} onSort={pfCtl.toggleSort} className="!p-0 !pb-2 text-right" defaultDir="desc" />
+                    <SortHeader label="Cost" sortKey="cost" activeKey={pfCtl.sortKey} dir={pfCtl.dir} onSort={pfCtl.toggleSort} className="!p-0 !pb-2 text-right" defaultDir="desc" />
+                    <SortHeader label="Profit" sortKey="profit" activeKey={pfCtl.sortKey} dir={pfCtl.dir} onSort={pfCtl.toggleSort} className="!p-0 !pb-2 text-right" defaultDir="desc" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {pfPag.pageItems.length === 0 && (
+                    <tr><td colSpan={4} className="py-6 text-center text-gray-500">No data</td></tr>
+                  )}
+                  {pfPag.pageItems.map((p) => (
+                    <tr key={p.name} className="border-t border-[#222]">
+                      <td className="py-2 pr-3">{p.name}</td>
+                      <td className="num py-2 pl-3 text-right">{formatCurrency(p.revenue, currency)}</td>
+                      <td className="num py-2 pl-3 text-right">{formatCurrency(p.cost, currency)}</td>
+                      <td className={`num py-2 pl-3 text-right font-medium ${p.profit >= 0 ? "text-green-400" : "text-red-400"}`}>
+                        {formatCurrency(p.profit, currency)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <Pagination
+              page={pfPag.page}
+              totalPages={pfPag.totalPages}
+              perPage={pfPag.perPage}
+              total={pfPag.total}
+              onPage={pfPag.setPage}
+              onPerPage={pfPag.setPerPage}
+            />
+          </AdminCard>
+        </div>
+      )}
+
+      {tab === "Inventory" && (
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
+            <StatCard label="Total Products" value={products.length} />
+            <StatCard label="Low Stock Items" value={lowStock.length} />
+            <StatCard label="Stock Value (cost)" value={formatCurrency(stockValue, currency)} />
+          </div>
+
+          <AdminCard title="Current Stock Levels">
+            <TableToolbar
+              query={invCtl.query}
+              onQuery={invCtl.setQuery}
+              placeholder="Search product…"
+              showDateRange={false}
+            />
+            <div className="-mx-1 overflow-x-auto px-1">
+              <table className="w-full min-w-[34rem] text-sm text-gray-300">
+                <thead>
+                  <tr className="whitespace-nowrap text-left text-xs text-gray-500">
+                    <SortHeader label="Product" sortKey="name" activeKey={invCtl.sortKey} dir={invCtl.dir} onSort={invCtl.toggleSort} className="!p-0 !pb-2" />
+                    <SortHeader label="Stock" sortKey="stock" activeKey={invCtl.sortKey} dir={invCtl.dir} onSort={invCtl.toggleSort} className="!p-0 !pb-2 text-right" defaultDir="desc" />
+                    <SortHeader label="Min" sortKey="min" activeKey={invCtl.sortKey} dir={invCtl.dir} onSort={invCtl.toggleSort} className="!p-0 !pb-2 text-right" defaultDir="desc" />
+                    <SortHeader label="Cost" sortKey="cost" activeKey={invCtl.sortKey} dir={invCtl.dir} onSort={invCtl.toggleSort} className="!p-0 !pb-2 text-right" defaultDir="desc" />
+                    <SortHeader label="Stock Value" sortKey="value" activeKey={invCtl.sortKey} dir={invCtl.dir} onSort={invCtl.toggleSort} className="!p-0 !pb-2 text-right" defaultDir="desc" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {invPag.pageItems.length === 0 && (
+                    <tr><td colSpan={5} className="py-6 text-center text-gray-500">No products</td></tr>
+                  )}
+                  {invPag.pageItems.map((p) => (
+                    <tr key={p.id} className="border-t border-[#222]">
+                      <td className="py-2 pr-3">{p.name}</td>
+                      <td className={`num py-2 pl-3 text-right font-medium ${p.stock <= 0 ? "text-red-400" : p.stock <= p.min ? "text-amber-400" : "text-green-400"}`}>
+                        {p.stock}
+                      </td>
+                      <td className="num py-2 pl-3 text-right text-gray-500">{p.min}</td>
+                      <td className="num py-2 pl-3 text-right">{formatCurrency(p.cost, currency)}</td>
+                      <td className="num py-2 pl-3 text-right">{formatCurrency(p.value, currency)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <Pagination
+              page={invPag.page}
+              totalPages={invPag.totalPages}
+              perPage={invPag.perPage}
+              total={invPag.total}
+              onPage={invPag.setPage}
+              onPerPage={invPag.setPerPage}
+            />
+          </AdminCard>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Line({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="num-row text-gray-400">
+      <span>{label}</span>
+      <span className="text-white">{value}</span>
+    </div>
+  );
+}

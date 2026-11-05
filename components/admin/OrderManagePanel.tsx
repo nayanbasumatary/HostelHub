@@ -1,0 +1,508 @@
+"use client";
+
+import { useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import toast from "react-hot-toast";
+import {
+  setOrderStatusAction,
+  assignDeliveryAction,
+  setPaymentStatusAction,
+  setOrderPaymentAction,
+  setOrderTypeAction,
+  setAmountPaidAction,
+} from "@/app/admin/orders/actions";
+import { AdminCard } from "@/components/admin/StatCard";
+import { Button } from "@/components/ui/button";
+import { formatCurrency } from "@/lib/utils/formatters";
+import { Input, Select } from "@/components/ui/input";
+import { Modal } from "@/components/ui/modal";
+import { adminSettableStatuses, statusLabel, nextStatuses } from "@/lib/utils/orderHelpers";
+import type { Order, OrderStatus, OrderType, Profile } from "@/lib/types";
+
+/**
+ * What the order already records for one leg of the payment, as a form value.
+ * A plain cash/UPI order stores the whole total under its method; a split
+ * stores the two legs explicitly.
+ */
+function seedLeg(order: Order, leg: "cash" | "upi", total: number): string {
+  const method = (order.payment_method ?? "").toLowerCase();
+  if (method === "split" || method === "credit") {
+    const amount = Number(leg === "cash" ? order.paid_cash : order.paid_upi) || 0;
+    return amount > 0 ? String(amount) : "";
+  }
+  return method === leg ? String(total) : "";
+}
+
+export function OrderManagePanel({
+  order,
+  deliveryPeople,
+  hasWalletOwner = false,
+  walletBalance = 0,
+}: {
+  order: Order;
+  deliveryPeople: Pick<Profile, "id" | "full_name">[];
+  /** Whether this order has a customer whose wallet credit can be charged. */
+  hasWalletOwner?: boolean;
+  /** That customer's current balance (negative = they owe the shop). */
+  walletBalance?: number;
+}) {
+  const [pending, startTransition] = useTransition();
+  const [showOtpModal, setShowOtpModal] = useState(false);
+  const [showCancelModal, setShowCancelModal] = useState(false);
+  const [otp, setOtp] = useState("");
+  const [cancelReason, setCancelReason] = useState("");
+  const [statusTarget, setStatusTarget] = useState<OrderStatus | null>(null);
+  const [amountPaid, setAmountPaid] = useState(String(order.amount_paid ?? ""));
+  const router = useRouter();
+
+  // Payment is entered as a cash / UPI / wallet mix, mirroring the manual-order
+  // form. Seeded from what the order already records so opening the panel shows
+  // the current split rather than a blank slate.
+  const total = Number(order.total_amount);
+  const initialMethod = (order.payment_method ?? "").toLowerCase();
+  const [cashIn, setCashIn] = useState(() => seedLeg(order, "cash", total));
+  const [upiIn, setUpiIn] = useState(() => seedLeg(order, "upi", total));
+  const [creditIn, setCreditIn] = useState(() =>
+    initialMethod === "credit" ? String(Math.max(total - Number(order.paid_cash ?? 0) - Number(order.paid_upi ?? 0), 0)) : ""
+  );
+
+  const run = (fn: () => Promise<{ ok: boolean; error?: string }>, ok: string) =>
+    startTransition(async () => {
+      try {
+        const res = await fn();
+        if (!res.ok) {
+          toast.error(res.error ?? "Failed");
+          return;
+        }
+        toast.success(ok);
+        router.refresh();
+      } catch {
+        toast.error("Something went wrong. Please try again.");
+      }
+    });
+
+  function requestStatusChange(status: OrderStatus) {
+    // Only online orders carry an OTP. Manual / walk-in orders have none, so the
+    // admin completes them directly without the OTP prompt.
+    if (status === "delivered" && !order.is_manual && order.otp_code) {
+      setStatusTarget(status);
+      setOtp("");
+      setShowOtpModal(true);
+      return;
+    }
+    if (status === "cancelled") {
+      setStatusTarget(status);
+      setCancelReason("");
+      setShowCancelModal(true);
+      return;
+    }
+    run(() => setOrderStatusAction(order.id, status), `Marked ${statusLabel(status, order.order_type)}`);
+  }
+
+  async function confirmOtpUpdate() {
+    if (!statusTarget) return;
+    startTransition(async () => {
+      try {
+        const res = await setOrderStatusAction(order.id, statusTarget, otp);
+        if (!res.ok) {
+          toast.error(res.error ?? "Failed");
+          return;
+        }
+        toast.success(`Marked ${statusLabel(statusTarget, order.order_type)}`);
+        setShowOtpModal(false);
+        setOtp("");
+        setStatusTarget(null);
+        router.refresh();
+      } catch {
+        toast.error("Something went wrong. Please try again.");
+      }
+    });
+  }
+
+  async function confirmCancel() {
+    if (!statusTarget) return;
+    if (!cancelReason.trim()) {
+      toast.error("Please provide a cancellation reason.");
+      return;
+    }
+
+    startTransition(async () => {
+      try {
+        const res = await setOrderStatusAction(order.id, statusTarget, undefined, cancelReason.trim());
+        if (!res.ok) {
+          toast.error(res.error ?? "Failed");
+          return;
+        }
+        toast.success(`Order cancelled`);
+        setShowCancelModal(false);
+        setCancelReason("");
+        setStatusTarget(null);
+        router.refresh();
+      } catch {
+        toast.error("Something went wrong. Please try again.");
+      }
+    });
+  }
+
+  const isDelivery = order.order_type === "delivery";
+  // Admin can't dispatch/complete a delivery order — that's the delivery partner's job.
+  const next = nextStatuses(order.status, order.order_type).filter(
+    (s) => !(isDelivery && (s === "out_for_delivery" || s === "delivered"))
+  );
+  const settable = adminSettableStatuses(order.order_type);
+  // Keep the current status visible in the dropdown even if admin can't set it.
+  const statusOptions = settable.includes(order.status) ? settable : [order.status, ...settable];
+  // Delivered = OTP-verified, cancelled = terminal. Both are final: no edits.
+  const finalized = order.status === "delivered" || order.status === "cancelled";
+
+  // Payment is editable even on finalized orders (e.g. fixing how a completed
+  // walk-in was actually paid).
+  const cashNum = Math.max(Number(cashIn) || 0, 0);
+  const upiNum = Math.max(Number(upiIn) || 0, 0);
+  const creditNum = Math.max(Number(creditIn) || 0, 0);
+  const collectedTotal = cashNum + upiNum + creditNum;
+  const hasCash = cashNum > 0;
+  const hasUpi = upiNum > 0;
+  const hasCredit = creditNum > 0;
+  // The wallet is the balancing item, so cash/UPI beyond the total parks there
+  // and anything the legs don't cover comes out of it.
+  const overpay = Math.max(cashNum + upiNum - total, 0);
+  const shortfall = Math.max(total - cashNum - upiNum, 0);
+
+  /** Pre-fill one method's field with the full total, zeroing the others. */
+  function pickMethod(m: "cash" | "upi" | "credit") {
+    setCashIn(m === "cash" ? String(total) : "");
+    setUpiIn(m === "upi" ? String(total) : "");
+    setCreditIn(m === "credit" ? String(total) : "");
+  }
+
+  const savePaymentLabel = hasCash || hasUpi || hasCredit
+    ? `Save · ${[
+        hasCredit ? `${formatCurrency(creditNum)} wallet` : null,
+        hasCash ? `${formatCurrency(cashNum)} cash` : null,
+        hasUpi ? `${formatCurrency(upiNum)} UPI` : null,
+      ]
+        .filter(Boolean)
+        .join(" + ")}`
+    : "Save payment";
+
+  function savePayment() {
+    if (hasCredit && !hasWalletOwner) {
+      toast.error("This order has no customer wallet to charge.");
+      return;
+    }
+    run(
+      () => setOrderPaymentAction(order.id, { cash: cashNum, upi: upiNum, credit: creditNum }),
+      "Payment updated"
+    );
+  }
+
+  return (
+    <AdminCard title="Manage Order">
+      <div className="space-y-5">
+        <div>
+          <p className="mb-2 text-xs font-medium uppercase text-black/50 dark:text-white/50">Quick actions</p>
+          <div className="flex flex-wrap gap-2">
+            {next.length === 0 && <span className="text-sm text-black/50 dark:text-white/50">No further actions.</span>}
+            {next.map((s) => (
+              <Button
+                key={s}
+                size="sm"
+                variant={s === "cancelled" ? "danger" : "dark"}
+                disabled={pending}
+                onClick={() => requestStatusChange(s)}
+              >
+                {s === "cancelled" ? "Cancel order" : `Mark ${statusLabel(s, order.order_type)}`}
+              </Button>
+            ))}
+          </div>
+          {isDelivery && (
+            <p className="mt-2 text-xs text-black/50 dark:text-white/50">
+              Dispatch &amp; delivery completion are done by the assigned delivery partner.
+            </p>
+          )}
+        </div>
+
+        <div>
+          <p className="mb-2 text-xs font-medium uppercase text-black/50 dark:text-white/50">Order type</p>
+          <Select
+            value={order.order_type}
+            disabled={pending}
+            onChange={(e) => run(() => setOrderTypeAction(order.id, e.target.value as OrderType), "Order type updated")}
+          >
+            <option value="pickup">Pickup</option>
+            <option value="delivery">Delivery</option>
+          </Select>
+        </div>
+
+        <div>
+          <p className="mb-2 text-xs font-medium uppercase text-black/50 dark:text-white/50">Set status</p>
+          <Select
+            value={order.status}
+            disabled={pending || finalized}
+            onChange={(e) => requestStatusChange(e.target.value as OrderStatus)}
+          >
+            {statusOptions.map((s) => (
+              <option key={s} value={s}>
+                {statusLabel(s, order.order_type)}
+              </option>
+            ))}
+          </Select>
+          {finalized && (
+            <p className="mt-2 text-xs text-black/50 dark:text-white/50">
+              {order.status === "delivered"
+                ? "Order is complete (OTP verified) — status is locked."
+                : "Order is cancelled — status is locked."}
+            </p>
+          )}
+        </div>
+
+        {order.order_type === "delivery" && (
+          <div>
+            <p className="mb-2 text-xs font-medium uppercase text-black/50 dark:text-white/50">Delivery person</p>
+            <Select
+              value={order.delivery_person_id ?? ""}
+              disabled={pending}
+              onChange={(e) =>
+                run(() => assignDeliveryAction(order.id, e.target.value || null), "Assigned")
+              }
+            >
+              <option value="">Unassigned</option>
+              {deliveryPeople.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.full_name ?? "Staff"}
+                </option>
+              ))}
+            </Select>
+          </div>
+        )}
+
+        <div>
+          <p className="mb-2 text-xs font-medium uppercase text-black/50 dark:text-white/50">Payment method</p>
+
+          {/* Three method buttons — each pre-fills its field with the full total. */}
+          <div className="grid grid-cols-3 gap-2">
+            {(["cash", "upi", "credit"] as const).map((m) => {
+              const isActive =
+                m === "cash"
+                  ? hasCash && !hasUpi && !hasCredit
+                  : m === "upi"
+                    ? hasUpi && !hasCash && !hasCredit
+                    : hasCredit;
+              const label = m === "cash" ? "Cash" : m === "upi" ? "UPI" : "Credit";
+              const disabled = m === "credit" && !hasWalletOwner;
+              return (
+                <button
+                  key={m}
+                  type="button"
+                  disabled={disabled || pending}
+                  title={disabled ? "This order has no customer wallet to charge" : undefined}
+                  onClick={() => pickMethod(m)}
+                  className={`rounded-lg border px-3 py-2 text-sm font-semibold transition-colors ${
+                    isActive
+                      ? "border-indigo-500 bg-indigo-500 text-white dark:border-indigo-400 dark:bg-indigo-500"
+                      : "border-black/15 bg-white text-stone-700 hover:bg-stone-50 dark:border-white/15 dark:bg-black dark:text-stone-200 dark:hover:bg-white/5"
+                  } disabled:cursor-not-allowed disabled:opacity-40`}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+          {hasWalletOwner && (
+            <p className="mt-1.5 text-xs text-stone-500 dark:text-stone-400">
+              {walletBalance < 0
+                ? `Wallet: owes ${formatCurrency(Math.abs(walletBalance))}`
+                : `Wallet: ${formatCurrency(walletBalance)} available`}
+            </p>
+          )}
+
+          {/* Three amount fields — always visible. */}
+          <div className="mt-3 space-y-3">
+            <div>
+              <p className="mb-1 text-xs text-black/50 dark:text-white/50">Cash received</p>
+              <Input
+                type="number"
+                inputMode="decimal"
+                min="0"
+                step="0.01"
+                value={cashIn}
+                onChange={(e) => setCashIn(e.target.value)}
+                placeholder="0"
+              />
+            </div>
+            <div>
+              <p className="mb-1 text-xs text-black/50 dark:text-white/50">UPI received</p>
+              <Input
+                type="number"
+                inputMode="decimal"
+                min="0"
+                step="0.01"
+                value={upiIn}
+                onChange={(e) => setUpiIn(e.target.value)}
+                placeholder="0"
+              />
+            </div>
+            <div>
+              <p className={`mb-1 text-xs text-black/50 dark:text-white/50 ${!hasWalletOwner ? "opacity-50" : ""}`}>
+                Credit received
+                {hasWalletOwner && walletBalance > 0 && (
+                  <span className="ml-1">— max {formatCurrency(Math.min(walletBalance, total))}</span>
+                )}
+              </p>
+              <Input
+                type="number"
+                inputMode="decimal"
+                min="0"
+                step="0.01"
+                value={creditIn}
+                onChange={(e) => setCreditIn(e.target.value)}
+                placeholder="0"
+                disabled={!hasWalletOwner}
+                className="disabled:opacity-40"
+              />
+              {!hasWalletOwner && (
+                <p className="mt-1 text-xs text-black/40 dark:text-white/40">
+                  This order has no customer to charge credit to.
+                </p>
+              )}
+            </div>
+          </div>
+
+          {/* Live breakdown — amber when short, lime when the excess parks in the wallet. */}
+          {(hasCash || hasUpi || hasCredit) && (
+            <div className="mt-3 rounded-lg border border-black/10 bg-stone-50 px-3 py-2 text-xs text-stone-600 dark:border-white/10 dark:bg-white/5 dark:text-stone-300">
+              {hasCash && <span>Cash {formatCurrency(cashNum)}</span>}
+              {hasCash && (hasUpi || hasCredit) && <span className="mx-1 opacity-40">+</span>}
+              {hasUpi && <span>UPI {formatCurrency(upiNum)}</span>}
+              {hasUpi && hasCredit && <span className="mx-1 opacity-40">+</span>}
+              {hasCredit && <span>Wallet {formatCurrency(creditNum)}</span>}
+              <span className="mx-1 opacity-40">=</span>
+              <span
+                className={
+                  collectedTotal < total
+                    ? "text-amber-600 dark:text-amber-400"
+                    : collectedTotal > total
+                      ? "text-lime-600 dark:text-lime-400"
+                      : "font-semibold"
+                }
+              >
+                {formatCurrency(collectedTotal)}
+              </span>
+              {shortfall > 0 && (
+                <span className="ml-1 text-amber-600 dark:text-amber-400">
+                  ({formatCurrency(shortfall)} {hasWalletOwner ? "from wallet" : "short"})
+                </span>
+              )}
+              {overpay > 0 && (
+                <span className="ml-1 text-lime-600 dark:text-lime-400">
+                  · {formatCurrency(overpay)} → wallet
+                </span>
+              )}
+            </div>
+          )}
+
+          <Button size="sm" className="mt-3 w-full" disabled={pending} onClick={savePayment}>
+            {savePaymentLabel}
+          </Button>
+        </div>
+
+        <div>
+          <p className="mb-2 text-xs font-medium uppercase text-black/50 dark:text-white/50">Payment status</p>
+          <div className="flex gap-2">
+            <Button
+              size="sm"
+              variant={order.payment_status === "paid" ? "dark" : "outline"}
+              disabled={pending}
+              onClick={() => run(() => setPaymentStatusAction(order.id, "paid"), "Marked paid")}
+            >
+              Paid
+            </Button>
+            <Button
+              size="sm"
+              variant={order.payment_status === "pending" ? "dark" : "outline"}
+              disabled={pending}
+              onClick={() => run(() => setPaymentStatusAction(order.id, "pending"), "Marked pending")}
+            >
+              Pending
+            </Button>
+          </div>
+
+          {/* Partial payment — record how much has actually been collected. */}
+          <div className="mt-3 flex items-end gap-2">
+            <div className="flex-1">
+              <p className="mb-1 text-xs text-black/50 dark:text-white/50">Amount paid (of {formatCurrency(order.total_amount)})</p>
+              <Input
+                type="number"
+                inputMode="numeric"
+                value={amountPaid}
+                onChange={(e) => setAmountPaid(e.target.value)}
+                placeholder="0"
+              />
+            </div>
+            <Button size="sm" disabled={pending} onClick={() => run(() => setAmountPaidAction(order.id, Number(amountPaid) || 0), "Payment recorded")}>
+              Save
+            </Button>
+          </div>
+          <p className="mt-1.5 text-xs text-black/50 dark:text-white/50">
+            Saving settles the order. Anything over {formatCurrency(total)} is kept as the customer&apos;s store
+            credit; anything short is recorded as credit they owe the shop.
+          </p>
+          {order.payment_status === "partial" && (
+            <p className="mt-1.5 text-xs font-medium text-amber-500">
+              Partial: {formatCurrency(order.amount_paid)} paid ·{" "}
+              {formatCurrency(Math.max(Number(order.total_amount) - Number(order.amount_paid), 0))} pending
+            </p>
+          )}
+        </div>
+      </div>
+
+      <Modal open={showOtpModal} onClose={() => setShowOtpModal(false)} title="Enter order OTP">
+        <p className="mb-4 text-sm text-gray-300">
+          Ask the customer for their 4-digit order OTP and enter it here to complete the order.
+        </p>
+        <label className="mb-2 block text-sm font-medium text-white">Order OTP</label>
+        <Input
+          value={otp}
+          onChange={(event) => setOtp(event.target.value.replace(/\D/g, "").slice(0, 4))}
+          placeholder="1234"
+          inputMode="numeric"
+          pattern="[0-9]*"
+          autoComplete="one-time-code"
+          maxLength={4}
+          className="mb-4 w-full tracking-[0.4em]"
+        />
+        <div className="flex justify-end gap-2">
+          <Button variant="outline" onClick={() => setShowOtpModal(false)} disabled={pending}>
+            Cancel
+          </Button>
+          <Button disabled={pending || otp.trim().length !== 4} onClick={confirmOtpUpdate}>
+            Confirm OTP
+          </Button>
+        </div>
+      </Modal>
+
+
+      <Modal open={showCancelModal} onClose={() => setShowCancelModal(false)} title="Cancellation reason">
+        <p className="mb-4 text-sm text-gray-300">
+          Tell the customer why this order cannot be fulfilled. This reason is saved with the cancelled order.
+        </p>
+        <label className="mb-2 block text-sm font-medium text-white">Reason</label>
+        <Input
+          value={cancelReason}
+          onChange={(event) => setCancelReason(event.target.value)}
+          placeholder="e.g. item out of stock"
+          className="mb-4 w-full"
+        />
+        <div className="flex justify-end gap-2">
+          <Button variant="outline" onClick={() => setShowCancelModal(false)} disabled={pending}>
+            Back
+          </Button>
+          <Button disabled={pending || !cancelReason.trim()} onClick={confirmCancel}>
+            Cancel order
+          </Button>
+        </div>
+      </Modal>
+    </AdminCard>
+  );
+}
