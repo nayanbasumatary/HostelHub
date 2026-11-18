@@ -110,7 +110,7 @@ function NavRow({ item, active }: { item: NavItem; active: boolean }) {
   );
 }
 
-export function Sidebar({ shopName = "FlopShop" }: { shopName?: string }) {
+export function Sidebar({ shopName = "HostelHub" }: { shopName?: string }) {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
 

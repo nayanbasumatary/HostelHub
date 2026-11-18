@@ -17,7 +17,7 @@ export interface NavUser {
 }
 
 export function Navbar({
-  shopName = "FlopShop",
+  shopName = "HostelHub",
   user = null,
   role = null,
   showMobileMenu = false,

@@ -1,6 +1,6 @@
 {
-  "name": "FlopShop",
-  "short_name": "FlopShop",
+  "name": "HostelHub",
+  "short_name": "HostelHub",
   "description": "Your Hostel Snack Shop",
   "start_url": "/",
   "display": "standalone",

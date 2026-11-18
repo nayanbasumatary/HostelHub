@@ -9,7 +9,7 @@ export function settingsToMap(rows: Pick<Setting, "key" | "value">[] | null): Se
 }
 
 export const DEFAULT_SETTINGS: SettingsMap = {
-  shop_name: "FlopShop",
+  shop_name: "HostelHub",
   shop_tagline: "Your Hostel Snack Shop",
   currency_symbol: "₹",
   delivery_fee: "10",

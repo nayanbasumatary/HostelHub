@@ -2,6 +2,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import SplashScreen from "@/components/SplashScreen";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -14,7 +15,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://flopshop.vercel.app"),
+  metadataBase: new URL("https://hostelhub-vert.vercel.app"),
   title: {
     default: "HostelHub – Hostel Snack Ordering",
     template: "%s · HostelHub",
@@ -40,7 +41,7 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
-        {children}
+        <SplashScreen>{children}</SplashScreen>
       </body>
     </html>
   );

@@ -1,10 +1,19 @@
+
 "use client";
 
 import { useState, useTransition } from "react";
 import Link from "next/link";
 import Image from "next/image";
 import { useRouter } from "next/navigation";
-import { MapPin, Phone, Package, QrCode, CheckCircle2, Wallet } from "lucide-react";
+import {
+  MapPin,
+  Phone,
+  Package,
+  QrCode,
+  CheckCircle2,
+  Wallet,
+  Navigation,
+} from "lucide-react";
 import toast from "react-hot-toast";
 import {
   setOrderStatusAction,
@@ -20,32 +29,58 @@ import { formatCurrency, formatTime } from "@/lib/utils/formatters";
 import { DOOR_CHANGE_MAX } from "@/lib/utils/orderHelpers";
 import type { Order } from "@/lib/types";
 
-export function DeliveryCard({ order, currency }: { order: Order; currency: string }) {
+export function DeliveryCard({
+  order,
+  currency,
+}: {
+  order: Order;
+  currency: string;
+}) {
   const [pending, startTransition] = useTransition();
   const [showOtp, setShowOtp] = useState(false);
   const [otp, setOtp] = useState("");
-  // Cash handed over at the door when the partner has no change (blank = exact).
   const [cashReceived, setCashReceived] = useState("");
-  // Shop-UPI payment (delivery person can't take UPI → customer pays the shop).
   const [showUpi, setShowUpi] = useState(false);
   const [upiOtp, setUpiOtp] = useState("");
   const [upiPaid, setUpiPaid] = useState(false);
+
   const router = useRouter();
 
-  // Wallet-credit orders are already paid for — nothing is collected at the door,
-  // so the partner must not be shown the shop QR or a payable amount. A partial
-  // credit order (wallet didn't cover the whole total) still has a balance due.
-  const amountDue = Math.max(Number(order.total_amount) - Number(order.amount_paid ?? 0), 0);
-  const prepaid = order.payment_method === "credit" && amountDue <= 0;
+  const amountDue = Math.max(
+    Number(order.total_amount) - Number(order.amount_paid ?? 0),
+    0
+  );
 
-  // "No change" settlement: only cash orders have change to round, and only the
-  // difference against the total moves — blank means the exact amount was paid.
-  const isCashOrder = (order.payment_method ?? "").toLowerCase() === "cash";
+  const prepaid =
+    order.payment_method === "credit" && amountDue <= 0;
+
+  const isCashOrder =
+    (order.payment_method ?? "").toLowerCase() === "cash";
+
   const total = Number(order.total_amount);
-  const received = cashReceived.trim() === "" ? null : Math.max(Number(cashReceived) || 0, 0);
-  const changeDelta = received === null ? 0 : Math.round((received - total) * 100) / 100;
+
+  const received =
+    cashReceived.trim() === ""
+      ? null
+      : Math.max(Number(cashReceived) || 0, 0);
+
+  const changeDelta =
+    received === null
+      ? 0
+      : Math.round((received - total) * 100) / 100;
+
   const changeMoves = Math.abs(changeDelta) >= 0.005;
   const changeTooBig = Math.abs(changeDelta) > DOOR_CHANGE_MAX;
+
+  // Hostel gate navigation
+  const hostelName = order.customer_room?.trim();
+
+const hostelMapUrl =
+  hostelName === "Stephen Hall"
+    ? "https://www.google.com/maps/dir/?api=1&destination=25.5697549%2C91.8852632"
+    : hostelName === "Vulmawi"
+      ? "https://www.google.com/maps/dir/?api=1&destination=25.56432%2C91.9004993"
+      : null;
 
   function update(status: "out_for_delivery" | "delivered") {
     if (status === "delivered") {
@@ -56,10 +91,12 @@ export function DeliveryCard({ order, currency }: { order: Order; currency: stri
     startTransition(async () => {
       try {
         const res = await setOrderStatusAction(order.id, status);
+
         if (!res.ok) {
           toast.error(res.error ?? "Failed");
           return;
         }
+
         toast.success("Out for delivery");
         router.refresh();
       } catch {
@@ -75,21 +112,24 @@ export function DeliveryCard({ order, currency }: { order: Order; currency: stri
 
   async function confirmDelivery() {
     if (changeTooBig) {
-      toast.error(`The difference can't be more than ${formatCurrency(DOOR_CHANGE_MAX, currency)}.`);
+      toast.error(
+        `The difference can't be more than ${formatCurrency(DOOR_CHANGE_MAX, currency)}.`
+      );
       return;
     }
+
     startTransition(async () => {
       try {
-        // Only take the wallet path when the cash actually differs from the
-        // total — an exact payment is an ordinary completion.
         const res =
           isCashOrder && received !== null && changeMoves
             ? await completeCashDeliveryAction(order.id, otp, received)
             : await setOrderStatusAction(order.id, "delivered", otp);
+
         if (!res.ok) {
           toast.error(res.error ?? "Failed");
           return;
         }
+
         toast.success(
           changeMoves
             ? changeDelta > 0
@@ -97,6 +137,7 @@ export function DeliveryCard({ order, currency }: { order: Order; currency: stri
               : `Delivered · ${formatCurrency(-changeDelta, currency)} owed by ${order.customer_name}`
             : "Marked delivered 🎉"
         );
+
         setShowOtp(false);
         setOtp("");
         setCashReceived("");
@@ -111,11 +152,12 @@ export function DeliveryCard({ order, currency }: { order: Order; currency: stri
     startTransition(async () => {
       try {
         const res = await confirmUpiToShopAction(order.id, upiOtp);
+
         if (!res.ok) {
           toast.error(res.error ?? "Failed");
           return;
         }
-        // Show the proof screen; the card disappears on refresh (now delivered).
+
         setUpiPaid(true);
         toast.success("Payment confirmed ✓");
       } catch {
@@ -127,6 +169,7 @@ export function DeliveryCard({ order, currency }: { order: Order; currency: stri
   function closeUpi() {
     setShowUpi(false);
     setUpiOtp("");
+
     if (upiPaid) {
       setUpiPaid(false);
       router.refresh();
@@ -137,39 +180,76 @@ export function DeliveryCard({ order, currency }: { order: Order; currency: stri
     <div className="glass rounded-2xl p-4 transition-all hover:border-lime-400/30">
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
-          <p className="truncate font-semibold text-white">{order.order_number}</p>
-          <p className="text-xs text-stone-500">{formatTime(order.created_at)}</p>
+          <p className="truncate font-semibold text-white">
+            {order.order_number}
+          </p>
+          <p className="text-xs text-stone-500">
+            {formatTime(order.created_at)}
+          </p>
         </div>
+
         <OrderStatusBadge status={order.status} />
       </div>
 
-      <div className="mt-3 space-y-1.5 text-sm text-stone-400">
-        <p className="break-words font-medium text-white">{order.customer_name}</p>
-        {order.customer_room && (
-          <p className="flex items-start gap-2">
-            <MapPin className="mt-0.5 h-4 w-4 shrink-0 text-lime-400/70" />
-            <span className="min-w-0 break-words">Room {order.customer_room}</span>
-          </p>
+      <div className="mt-3 space-y-3 text-sm text-stone-400">
+        <p className="break-words font-medium text-white">
+          {order.customer_name}
+        </p>
+
+        {/* Hostel Gate Navigation */}
+        {hostelName && (
+          <div className="rounded-xl bg-black/20 p-3">
+            <p className="flex items-center gap-2 font-semibold text-white">
+              <MapPin className="h-4 w-4 text-lime-400" />
+              {hostelName}
+            </p>
+
+            {hostelMapUrl && (
+              <a
+                href={hostelMapUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="mt-3 flex items-center justify-center gap-2 rounded-lg bg-lime-400 px-3 py-2.5 text-sm font-bold text-black transition hover:bg-lime-300"
+              >
+                <Navigation className="h-4 w-4" />
+                Navigate to Hostel Gate
+              </a>
+            )}
+
+            {hostelName === "Vulmawi" && (
+              <p className="mt-2 text-xs text-amber-300">
+                Nearby church landmark. Confirm the exact hostel gate with the customer.
+              </p>
+            )}
+          </div>
         )}
+
         {order.customer_phone && (
           <p className="flex items-center gap-2">
             <Phone className="h-4 w-4 shrink-0 text-lime-400/70" />
-            <a href={`tel:${order.customer_phone}`} className="min-w-0 break-words hover:underline">
+            <a
+              href={`tel:${order.customer_phone}`}
+              className="min-w-0 break-words hover:underline"
+            >
               {order.customer_phone}
             </a>
           </p>
         )}
+
         <p className="flex items-start gap-2">
           <Package className="mt-0.5 h-4 w-4 shrink-0 text-lime-400/70" />
           <span className="min-w-0 break-words">
-            {order.order_items?.length ?? 0} item{(order.order_items?.length ?? 0) > 1 ? "s" : ""} ·{" "}
+            {order.order_items?.length ?? 0} item
+            {(order.order_items?.length ?? 0) > 1 ? "s" : ""} ·{" "}
             {formatCurrency(order.total_amount, currency)} ·{" "}
             {prepaid ? "PREPAID" : order.payment_method.toUpperCase()}
           </span>
         </p>
+
         {prepaid && (
           <p className="inline-flex items-center gap-1.5 rounded-full bg-lime-400/10 px-2.5 py-1 text-xs font-semibold text-lime-300">
-            <Wallet className="h-3.5 w-3.5" /> Paid by wallet · collect nothing
+            <Wallet className="h-3.5 w-3.5" />
+            Paid by wallet · collect nothing
           </p>
         )}
       </div>
@@ -188,6 +268,7 @@ export function DeliveryCard({ order, currency }: { order: Order; currency: stri
         <p className="mb-2.5 text-xs font-semibold text-lime-400">
           You earn {formatCurrency(order.delivery_person_earning, currency)}
         </p>
+
         <div className="grid grid-cols-2 gap-2.5">
           <Link
             href={`/orders/${order.id}?from=delivery`}
@@ -197,22 +278,43 @@ export function DeliveryCard({ order, currency }: { order: Order; currency: stri
               Details
             </Button>
           </Link>
-          {order.status !== "delivered" && order.status !== "out_for_delivery" && (
-            <Button size="sm" variant="outline" className="w-full" disabled={pending} onClick={() => update("out_for_delivery")}>
-              Pick up
-            </Button>
-          )}
+
+          {order.status !== "delivered" &&
+            order.status !== "out_for_delivery" && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="w-full"
+                disabled={pending}
+                onClick={() => update("out_for_delivery")}
+              >
+                Pick up
+              </Button>
+            )}
+
           {order.status !== "delivered" && !prepaid && (
-            <Button size="sm" variant="outline" className="w-full" disabled={pending} onClick={() => setShowUpi(true)}>
-              <QrCode className="h-4 w-4" /> UPI to shop
+            <Button
+              size="sm"
+              variant="outline"
+              className="w-full"
+              disabled={pending}
+              onClick={() => setShowUpi(true)}
+            >
+              <QrCode className="h-4 w-4" />
+              UPI to shop
             </Button>
           )}
+
           {order.status !== "delivered" && (
             <Button
               size="sm"
               disabled={pending}
               onClick={() => update("delivered")}
-              className={`w-full ${order.status === "out_for_delivery" || prepaid ? "col-span-2" : ""}`}
+              className={`w-full ${
+                order.status === "out_for_delivery" || prepaid
+                  ? "col-span-2"
+                  : ""
+              }`}
             >
               Mark delivered
             </Button>
@@ -220,17 +322,23 @@ export function DeliveryCard({ order, currency }: { order: Order; currency: stri
         </div>
       </div>
 
+      {/* Delivery OTP Modal */}
       <Modal open={showOtp} onClose={closeOtp} title="Enter delivery OTP">
         <p className="mb-5 text-center text-sm text-stone-400">
           Ask the customer for their 4-digit order OTP.
         </p>
+
         <OtpInput value={otp} onChange={setOtp} autoFocus />
 
         {isCashOrder && (
           <div className="mt-5">
-            <label htmlFor={`cash-${order.id}`} className="mb-1.5 block text-sm font-medium text-stone-300">
+            <label
+              htmlFor={`cash-${order.id}`}
+              className="mb-1.5 block text-sm font-medium text-stone-300"
+            >
               Cash received — leave blank if exact
             </label>
+
             <Input
               id={`cash-${order.id}`}
               type="number"
@@ -241,13 +349,15 @@ export function DeliveryCard({ order, currency }: { order: Order; currency: stri
               onChange={(e) => setCashReceived(e.target.value)}
               placeholder={String(total)}
             />
+
             <p className="mt-1.5 text-xs text-stone-500">
               No change? Enter what they handed over — the difference goes to their wallet.
             </p>
+
             {changeTooBig ? (
               <p className="mt-2 rounded-lg bg-red-500/10 px-3 py-2 text-xs font-medium text-red-300">
-                Difference is over {formatCurrency(DOOR_CHANGE_MAX, currency)}. Collect the exact
-                amount, or take the payment on the shop QR instead.
+                Difference is over {formatCurrency(DOOR_CHANGE_MAX, currency)}.
+                Collect the exact amount, or take the payment on the shop QR instead.
               </p>
             ) : (
               changeMoves && (
@@ -268,9 +378,15 @@ export function DeliveryCard({ order, currency }: { order: Order; currency: stri
         )}
 
         <div className="mt-6 grid grid-cols-2 gap-2.5">
-          <Button variant="outline" className="w-full" onClick={closeOtp} disabled={pending}>
+          <Button
+            variant="outline"
+            className="w-full"
+            onClick={closeOtp}
+            disabled={pending}
+          >
             Cancel
           </Button>
+
           <Button
             className="w-full"
             disabled={pending || otp.length !== 4 || changeTooBig}
@@ -281,14 +397,24 @@ export function DeliveryCard({ order, currency }: { order: Order; currency: stri
         </div>
       </Modal>
 
-      <Modal open={showUpi} onClose={closeUpi} title={upiPaid ? "Payment confirmed" : "Pay to shop UPI"}>
+      {/* Shop UPI QR Modal */}
+      <Modal
+        open={showUpi}
+        onClose={closeUpi}
+        title={upiPaid ? "Payment confirmed" : "Pay to shop UPI"}
+      >
         {upiPaid ? (
           <div className="flex flex-col items-center py-4 text-center">
             <CheckCircle2 className="h-14 w-14 text-lime-400" />
+
             <p className="mt-3 text-lg font-bold text-white">
               Paid {formatCurrency(order.total_amount, currency)} via UPI
             </p>
-            <p className="mt-1 text-sm text-stone-400">Money received in the shop&apos;s account · Order delivered ✓</p>
+
+            <p className="mt-1 text-sm text-stone-400">
+              Money received in the shop&apos;s account · Order delivered ✓
+            </p>
+
             <Button className="mt-5 w-full" onClick={closeUpi}>
               Done
             </Button>
@@ -299,8 +425,9 @@ export function DeliveryCard({ order, currency }: { order: Order; currency: stri
               <p className="num max-w-full text-2xl font-extrabold text-stone-900">
                 {formatCurrency(order.total_amount, currency)}
               </p>
+
               <Image
-                src="/QR.jpeg"
+                src="/qr.jpeg"
                 alt="Shop UPI QR code — scan to pay"
                 width={180}
                 height={180}
@@ -308,12 +435,24 @@ export function DeliveryCard({ order, currency }: { order: Order; currency: stri
                 priority
               />
             </div>
+
             <OtpInput value={upiOtp} onChange={setUpiOtp} autoFocus />
+
             <div className="mt-6 grid grid-cols-2 gap-2.5">
-              <Button variant="outline" className="w-full" onClick={closeUpi} disabled={pending}>
+              <Button
+                variant="outline"
+                className="w-full"
+                onClick={closeUpi}
+                disabled={pending}
+              >
                 Cancel
               </Button>
-              <Button className="w-full" disabled={pending || upiOtp.length !== 4} onClick={confirmUpiPayment}>
+
+              <Button
+                className="w-full"
+                disabled={pending || upiOtp.length !== 4}
+                onClick={confirmUpiPayment}
+              >
                 Confirm payment
               </Button>
             </div>

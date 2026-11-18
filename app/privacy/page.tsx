@@ -45,7 +45,7 @@ export default function PrivacyPage() {
             <p>
               Questions? Message us on WhatsApp at{" "}
               <a
-                href="https://wa.me/918133860088"
+                href="https://wa.me/919101611198"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-lime-400 hover:underline"

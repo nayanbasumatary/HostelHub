@@ -2,7 +2,8 @@ import Image from "next/image";
 import Link from "next/link";
 
 const WHATSAPP_URL =
-  "https://wa.me/918133860088?text=" + encodeURIComponent("Hi HostelHub! I'd like to know more.");
+  "https://wa.me/919101611198?text=" +
+  encodeURIComponent("Hi HostelHub! I'd like to know more.");
 
 function WhatsAppIcon({ className }: { className?: string }) {
   return (
